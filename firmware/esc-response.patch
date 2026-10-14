@@ -1,0 +1,302 @@
+--- a/Core/Inc/motor_board_config.hpp
++++ b/Core/Inc/motor_board_config.hpp
+@@ -3,15 +3,17 @@
+ namespace motor::board {
+ // Boot remains PWM-off; explicit arm + command and validated limits are required.
+ constexpr bool enable_power_stage = true;
+-// User's bench supply: 20 V, 1 A current limit. Supply and phase current differ.
++// Bus voltage window and phase protection are separate from the q-axis cap.
+ constexpr float pot_maximum_iq = 1.0f;
+ constexpr float bench_bus_min = 18.0f, bench_bus_max = 22.0f;
+-constexpr float bench_phase_trip = 2.0f, bench_identify_voltage = 0.2f;
++constexpr float bench_phase_trip = 4.0f, bench_identify_voltage = 0.2f;
+ // Nominal wheel hypothesis supported by two 398-cycle/2-wheel-turn trials.
+ constexpr unsigned wheel_pole_pairs = 2;
+ constexpr float wheel_gear_ratio = 99.5f;
+ constexpr float wheel_electrical_cycles = wheel_pole_pairs*wheel_gear_ratio;
+-constexpr float wheel_min_rpm = 8, wheel_max_rpm = 15, wheel_slew_rpm_per_s = 2;
++constexpr float wheel_min_rpm = 8, wheel_max_rpm = 15, wheel_slew_rpm_per_s = 10;
++constexpr float wheel_max_slew_rpm_per_s = 20;
++constexpr float wheel_maximum_iq = 2.0f;
+ constexpr float electrical_hz_from_wheel_rpm(float rpm) { return rpm*wheel_electrical_cycles/60; }
+ constexpr float wheel_rpm_from_electrical_hz(float hz) { return hz*60/wheel_electrical_cycles; }
+ constexpr float adc_reference = 3.3f; // nominal VDDA; verify with a meter
+--- a/Core/Inc/motor_control.hpp
++++ b/Core/Inc/motor_control.hpp
+@@ -80,7 +80,8 @@
+   bool finish_identification();
+   bool run(Limits limits, Parameters parameters, float electrical_hz, float iq);
+   bool run_speed(Limits limits, Parameters parameters, float electrical_hz,
+-                 float maximum_current, float slew_hz_per_s, bool continuous = false);
++                 float maximum_current, float slew_hz_per_s, bool continuous = false,
++                 float startup_hz = 0);
+   bool set_speed_reference(float electrical_hz);
+   bool speed_mode() const { return speed_mode_; }
+   SpeedLoop speed_loop{};
+@@ -128,6 +129,7 @@
+   float requested_iq_ = 0, maximum_iq_ = 0;
+   bool current_mode_ = false;
+   bool speed_mode_ = false;
++  bool responsive_speed_ = false;
+   bool continuous_speed_ = false; // UART adapter must enforce keepalive.
+   unsigned speed_divider_ = 0;
+   bool index_sync_seen_ = false;
+--- a/Core/Inc/motor_speed.hpp
++++ b/Core/Inc/motor_speed.hpp
+@@ -8,11 +8,12 @@
+ class SpeedLoop {
+  public:
+   static constexpr float period=.001f, kp=.015f, ki=.05f;
+-  bool start(float hz,float maximum_current,float slew_hz_per_s) {
++  bool start(float hz,float maximum_current,float slew_hz_per_s,bool responsive=false) {
+     if (!std::isfinite(hz) || hz < 10 || hz > 100 ||
+-        !std::isfinite(maximum_current) || maximum_current <= 0 || maximum_current > 1 ||
++        !std::isfinite(maximum_current) || maximum_current <= 0 || maximum_current > 2 ||
+         !std::isfinite(slew_hz_per_s) || slew_hz_per_s <= 0 || slew_hz_per_s > 100) return false;
+     *this=SpeedLoop{}; requested=reference=hz; limit=maximum_current; slew=slew_hz_per_s;
++    kp_=responsive ? .04f : kp; ki_=responsive ? .2f : ki;
+     return true;
+   }
+   bool set_target(float hz) {
+@@ -28,11 +29,11 @@
+     if (!engaged || !observe(measured_hz)) return false;
+     reference+=std::clamp(requested-reference,-slew*period,slew*period);
+     const float error=reference-feedback;
+-    const float trial=kp*error+integral_;
++    const float trial=kp_*error+integral_;
+     // Conditional integration: never accumulate further into a current limit.
+     if ((trial < limit || error < 0) && (trial > 0 || error > 0))
+-      integral_=std::clamp(integral_+ki*period*error,0.0f,limit);
+-    output=std::clamp(kp*error+integral_,0.0f,limit);
++      integral_=std::clamp(integral_+ki_*period*error,0.0f,limit);
++    output=std::clamp(kp_*error+integral_,0.0f,limit);
+     return true;
+   }
+   bool observe(float measured_hz) {
+@@ -43,6 +44,6 @@
+   float requested=0,reference=0,feedback=0,output=0,limit=0,slew=0;
+   bool engaged=false;
+  private:
+-  float integral_=0;
++  float integral_=0, kp_=kp, ki_=ki;
+ };
+ }
+--- a/Core/Src/motor_control.cpp
++++ b/Core/Src/motor_control.cpp
+@@ -165,7 +165,7 @@
+ void Controller::stop()
+ {
+   index_profile.abort();
+-  speed_mode_=false; continuous_speed_=false; speed_loop={}; speed_divider_=0;
++  speed_mode_=false; continuous_speed_=false; responsive_speed_=false; speed_loop={}; speed_divider_=0;
+   state = State::idle; fault = Fault::none;
+   current_loop_.reset(); observer.reset();
+   current_reference = current_feedback = {};
+@@ -213,22 +213,29 @@
+   startup_iq_minimum = 0;
+   state = State::align;
+   index_profile = {}; index_sync_checked = false;
+-  speed_mode_=false; continuous_speed_=false; speed_loop={}; speed_divider_=0;
++  speed_mode_=false; continuous_speed_=false; responsive_speed_=false; speed_loop={}; speed_divider_=0;
+   reset_hfi();
+   return true;
+ }
+-bool Controller::run_speed(Limits limits, Parameters p, float hz, float maximum_current, float slew_hz_per_s, bool continuous)
++bool Controller::run_speed(Limits limits, Parameters p, float hz, float maximum_current, float slew_hz_per_s, bool continuous, float startup_hz)
+ {
+   SpeedLoop candidate;
+-  if (hfi_mode_ != HfiMode::off || maximum_current > .5f*limits.current ||
+-      !candidate.start(hz,maximum_current,slew_hz_per_s) ||
+-      !run(limits,p,hz,std::min(maximum_current,.3f))) return false;
++  if (!std::isfinite(startup_hz) || (startup_hz != 0 && (startup_hz < 10 || startup_hz > 100)) ||
++      hfi_mode_ != HfiMode::off || maximum_current > .5f*limits.current ||
++      !candidate.start(hz,maximum_current,slew_hz_per_s,startup_hz > 0) ||
++      !run(limits,p,startup_hz > 0 ? std::min(hz,startup_hz) : hz,
++           std::min(maximum_current,startup_hz > 0 ? .6f : .3f))) return false;
+   speed_loop=candidate; speed_mode_=true; continuous_speed_=continuous;
++  responsive_speed_=startup_hz > 0;
+   return true;
+ }
+ bool Controller::set_speed_reference(float hz)
+ {
+-  return speed_mode_ && state==State::closed && speed_loop.set_target(hz);
++  // During the faster UART startup, accept the newest desired speed while the
++  // bounded I/f profile acquires the observer at a fixed entry speed. Retargeting
++  // does not reset alignment, ramp timing, lock checks or the current controller.
++  return speed_mode_ && (state==State::closed || (responsive_speed_ &&
++      (state==State::align || state==State::ramp || state==State::blend))) && speed_loop.set_target(hz);
+ }
+ bool Controller::index_wheel(Limits limits, Parameters p, float current)
+ {
+@@ -398,15 +405,15 @@
+   float angle = forced_angle_;
+   DQ target{0, target_iq_};
+   if (state == State::align) {
+-    target = {target_iq_ * std::min(1.0f, ticks_ * dt / 0.2f), 0};
+-    if (ticks_ >= 10000) {
++    target = {target_iq_ * std::min(1.0f, ticks_ * dt / (responsive_speed_ ? .1f : .2f)), 0};
++    if (ticks_ >= (responsive_speed_ ? 5000U : 10000U)) {
+       state = State::ramp; ticks_ = 0; observer.reset(forced_angle_, 0);
+     }
+   } else if (state == State::ramp) {
+     // I/f startup: the stator current vector leads a following rotor by its
+     // load angle. A q-axis vector here would shift the observer by ~90 degrees.
+     target = {target_iq_, 0};
+-    forced_omega_ = std::min(target_omega_, forced_omega_ + target_omega_ * dt / 3);
++    forced_omega_ = std::min(target_omega_, forced_omega_ + target_omega_ * dt / (responsive_speed_ ? .8f : 3.f));
+     forced_angle_ = wrap(forced_angle_ + forced_omega_ * dt);
+     angle = forced_angle_;
+     const float load_angle = wrap(estimated_angle - forced_angle_);
+@@ -441,7 +448,7 @@
+     else if (ticks_ >= 120000) { trip(torque_ready ? Fault::observer : Fault::timeout); return {}; }
+   } else if (state == State::blend) {
+     forced_angle_ = wrap(forced_angle_ + forced_omega_ * dt);
+-    const float fraction = std::min(1.0f, ticks_ * dt / 0.5f);
++    const float fraction = std::min(1.0f, ticks_ * dt / .5f);
+     angle = wrap(forced_angle_ + fraction * wrap(estimated_angle - forced_angle_));
+     const float iq = speed_mode_ ? speed_loop.output : (current_mode_ ? requested_iq_ :
+         std::clamp(target_iq_ * (target_omega_ - estimated_omega) /
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -428,7 +428,7 @@
+   return outputs_enabled;
+ }
+ 
+-void print_status()
++void print_status(bool compact=false)
+ {
+   Measurements m;
+   motor::State state;
+@@ -465,6 +465,21 @@
+     reverse = pot_reference.reversed(); ready = protection_ready;
+     bdtr = TIM1->BDTR; ccer = TIM1->CCER;
+   }
++  if (compact && speed_active) {
++    printf("state=%s fault=%s cal=%s n=%lu bus_mV=%ld MOE=%u CCER=0x%lx R_mOhm=%ld L_uH=%ld "
++           "cart_protocol=3 speed_mode=1 uart_direction=%d req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld "
++           "iq_max_mA=%ld slew_mrpm_s=%ld iq_mA=%ld peak_mA=%ld,%ld,%ld\r\n",
++           motor::name(state),motor::name(fault),m.calibrated ? "ok" : "pending",
++           static_cast<unsigned long>(m.samples),lroundf(m.bus*1000),(bdtr&TIM_BDTR_MOE)!=0,
++           static_cast<unsigned long>(ccer),lroundf(p.resistance*1000),lroundf(p.inductance*1e6f),
++           serial_direction,lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.requested)*1000),
++           lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.reference)*1000),
++           lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.feedback)*1000),
++           lroundf(speed.limit*1000),lroundf(cfg::wheel_rpm_from_electrical_hz(speed.slew)*1000),
++           lroundf(feedback.q*1000),lroundf(m.peak_current[0]*1000),
++           lroundf(m.peak_current[1]*1000),lroundf(m.peak_current[2]*1000));
++    return;
++  }
+   printf("state=%s fault=%s cal=%s n=%lu slow=%lu bus_mV=%ld ntc=%u pot=%u "
+          "raw=%u,%u,%u zero=%ld,%ld,%ld span=%u,%u,%u i_mA=%ld,%ld,%ld "
+          "MOE=%u CCER=0x%lx max_cycles=%lu R_mOhm=%ld L_uH=%ld "
+@@ -473,8 +488,8 @@
+          "drive_n=%lu peak_mA=%ld,%ld,%ld break_ready=%u break_sr=0x%lx break_comp=%lu "
+          "candidate_R_mOhm=%ld candidate_L_uH=%ld emf_mV=%ld pll_mrad=%ld start_mrad=%ld lock_n=%lu "
+          "adc_min_cnt=%u pwm_min_cnt=%u start_iq_min_mA=%ld uart_iq_active=%u "
+-         "uart_req_mA=%ld uart_iq_mA=%ld uart_direction=%d cart_protocol=2 "
+-         "speed_mode=%u req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld iq_max_mA=%ld engaged=%u\r\n",
++         "uart_req_mA=%ld uart_iq_mA=%ld uart_direction=%d cart_protocol=3 "
++         "speed_mode=%u req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld iq_max_mA=%ld engaged=%u slew_mrpm_s=%ld\r\n",
+          motor::name(state), motor::name(fault),
+          m.calibrated ? "ok" : (m.calibration_failed ? "failed" : "pending"),
+          static_cast<unsigned long>(m.samples), static_cast<unsigned long>(m.regular_samples),
+@@ -502,7 +517,7 @@
+          speed_active, lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.requested)*1000),
+          lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.reference)*1000),
+          lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.feedback)*1000),
+-         lroundf(speed.limit*1000), speed.engaged);
++         lroundf(speed.limit*1000), speed.engaged, lroundf(cfg::wheel_rpm_from_electrical_hz(speed.slew)*1000));
+ }
+ void finish_identification()
+ {
+@@ -645,11 +660,11 @@
+ void command(char *line)
+ {
+   if (!strcmp(line, "cartcap")) {
+-    printf("cart_protocol=2 signed_iq=1 signed_rpm=1 continuous_speed=1 reverse_dwell_ms=2000 watchdog_ms=500 "
+-           "bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld min_mrpm=8000 max_mrpm=15000 "
+-           "startup_mA=300 slew_mrpm_s=2000\r\n",
++    printf("cart_protocol=3 signed_iq=1 signed_rpm=1 continuous_speed=1 reverse_dwell_ms=2000 watchdog_ms=500 "
++           "bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld max_speed_iq_mA=2000 phase_trip_mA=%ld min_mrpm=8000 max_mrpm=15000 "
++           "startup_mA=600 slew_mrpm_s=10000 max_slew_mrpm_s=20000 startup_target_mrpm=8000 live_target=1\r\n",
+            lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),
+-           lroundf(cfg::pot_maximum_iq*1000));
++           lroundf(cfg::pot_maximum_iq*1000), lroundf(limits.current*1000));
+     return;
+   }
+   if (!strcmp(line, "status")) { print_status(); return; }
+@@ -663,7 +678,7 @@
+            "runpot electrical_Hz startup_A | hfi off | hfi monitor V | hfi assist V | "
+            "runiq signed_electrical_Hz startup_A signed_Iq_A | iq signed_Iq_A (0=stop; direction change requires stop+dwell) | "
+            "hfitest V seconds | hfistatus | wheel start turns | wheel finish | wheel exit | wheelstatus | "
+-           "index A (398 electrical cycles) | indexstatus | runrpm signed_wheel_RPM Imax_A (0.1..1 A) | "
++           "index A (398 electrical cycles) | indexstatus | runrpm signed_wheel_RPM Imax_A [accel_RPM_s] (0.1..2 A, 1..20 RPM/s) | "
+            "rpm signed_wheel_RPM (magnitude 8..15, 0=PWM stop) | speedstatus | ping\r\n"); return;
+   }
+   if (!strcmp(line, "stop")) {
+@@ -692,7 +707,7 @@
+       }
+     }
+     if (accepted) printf("OK wheel_target_mrpm=%ld\r\n",lroundf(value[0]*1000));
+-    else printf("ERR rpm requires closed runrpm in same direction; magnitude 8..15 RPM; fault=%s\r\n",
++    else printf("ERR rpm requires active runrpm in same direction; magnitude 8..15 RPM; fault=%s\r\n",
+                 motor::name(controller.fault));
+     return;
+   }
+@@ -788,7 +803,8 @@
+   const bool runiq = !strncmp(line, "runiq ", 6) && parse_numbers(line + 6, value, 3);
+   const bool hfitest = !strncmp(line, "hfitest ", 8) && parse_numbers(line+8,value,2);
+   const bool index = !strncmp(line, "index ", 6) && parse_numbers(line+6,value,1);
+-  const bool runrpm = !strncmp(line, "runrpm ", 7) && parse_numbers(line+7,value,2);
++  const bool runrpm = !strncmp(line, "runrpm ", 7) &&
++      (parse_numbers(line+7,value,3) || (parse_numbers(line+7,value,2) && (value[2]=cfg::wheel_slew_rpm_per_s,true)));
+   if (identify || run || runpot || runiq || hfitest || index || runrpm) {
+     if (!cfg::enable_power_stage || !armed) { printf("ERR drive disabled or not armed\r\n"); return; }
+     bool accepted;
+@@ -802,9 +818,10 @@
+         pot_mode = false;
+         if (runrpm) {
+           accepted=std::abs(value[0])>=cfg::wheel_min_rpm && std::abs(value[0])<=cfg::wheel_max_rpm &&
+-              value[1]>=.1f && value[1]<=1.f &&
++              value[1]>=.1f && value[1]<=cfg::wheel_maximum_iq && value[2]>=1 && value[2]<=cfg::wheel_max_slew_rpm_per_s &&
+               controller.run_speed(limits,controller.parameters,cfg::electrical_hz_from_wheel_rpm(std::abs(value[0])),
+-                                   value[1],cfg::electrical_hz_from_wheel_rpm(cfg::wheel_slew_rpm_per_s),true);
++                                   value[1],cfg::electrical_hz_from_wheel_rpm(value[2]),true,
++                                   cfg::electrical_hz_from_wheel_rpm(cfg::wheel_min_rpm));
+         } else if (runpot) {
+           // Permit setting a small current while stopped, then explicitly
+           // starting. Reject a knob position above the selected startup current
+@@ -902,7 +919,7 @@
+       if (raw[i] < 32 || raw[i] > 4063 || std::abs(measurement.current[i]) > limits.current)
+         trip(motor::Fault::current);
+     if (std::abs(measurement.current[0] + measurement.current[1] + measurement.current[2]) >
+-        std::max(0.3f, 0.3f * limits.current)) trip(motor::Fault::sample);
++        std::max(0.3f, 0.3f * std::min(limits.current,2.0f))) trip(motor::Fault::sample);
+     if (outputs_enabled && !(TIM1->BDTR & TIM_BDTR_MOE)) trip(motor::Fault::break_input);
+     if (outputs_enabled && bootstrap_samples) {
+       if (--bootstrap_samples == 0) {
+@@ -1021,6 +1038,7 @@
+   unsigned length = 0;
+   bool overflow = false, receive_error = false, led_on = false;
+   uint32_t last_report = HAL_GetTick(), last_led = last_report, last_hfi = last_report;
++  motor::Fault last_reported_fault = motor::Fault::none;
+   uint32_t button_changed = last_report;
+   bool button_raw = false, button_stable = false;
+   while (true) {
+@@ -1053,10 +1071,13 @@
+       }
+     }
+     if (now - last_led >= 500) { last_led = now; led_on = !led_on; led = led_on; }
+-    if (now - last_report >= (outputs_enabled ? 100U : (wheel_mode ? 500U : 1000U))) {
+-      last_report = now;
++    motor::Fault report_fault;
++    { InterruptLock lock; report_fault=controller.fault; }
++    if (report_fault != last_reported_fault ||
++        now - last_report >= (outputs_enabled ? 100U : (wheel_mode ? 500U : 1000U))) {
++      last_report = now; last_reported_fault=report_fault;
+       if (wheel_mode) print_wheel_status();
+-      else print_status();
++      else print_status(report_fault == motor::Fault::none);
+     }
+     if (controller.hfi_mode() != motor::HfiMode::off && now-last_hfi >= 500) {
+       last_hfi = now; print_hfi_status();

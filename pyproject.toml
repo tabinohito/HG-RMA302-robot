@@ -1,0 +1,17 @@
+[project]
+name = "hg-rma302-robot"
+version = "0.1.0"
+description = "F310/F710 XInput wheel speed control for two B-G431B-ESC1 boards"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pyserial>=3.5,<4", "evdev>=1.7,<2; sys_platform == 'linux'"]
+
+[project.scripts]
+hg-cart = "hg_rma302.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hg_rma302*"]

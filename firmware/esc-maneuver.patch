@@ -1,0 +1,315 @@
+--- a/Core/Inc/motor_board_config.hpp
++++ b/Core/Inc/motor_board_config.hpp
+@@ -11,7 +11,7 @@
+ constexpr unsigned wheel_pole_pairs = 2;
+ constexpr float wheel_gear_ratio = 99.5f;
+ constexpr float wheel_electrical_cycles = wheel_pole_pairs*wheel_gear_ratio;
+-constexpr float wheel_min_rpm = 8, wheel_max_rpm = 15, wheel_slew_rpm_per_s = 10;
++constexpr float wheel_min_rpm = 8, wheel_max_rpm = 25, wheel_slew_rpm_per_s = 20;
+ constexpr float wheel_max_slew_rpm_per_s = 20;
+ constexpr float wheel_maximum_iq = 2.0f;
+ constexpr float electrical_hz_from_wheel_rpm(float rpm) { return rpm*wheel_electrical_cycles/60; }
+--- a/Core/Inc/motor_control.hpp
++++ b/Core/Inc/motor_control.hpp
+@@ -65,7 +65,7 @@
+   bool primed_ = false;
+ };
+ 
+-enum class State : uint8_t { idle, identify, identify_ready, hfi_probe, align, ramp, blend, closed, index, fault };
++enum class State : uint8_t { idle, identify, identify_ready, hfi_probe, align, ramp, blend, closed, decelerate, settle, ready, index, fault };
+ enum class Fault : uint8_t {
+   none, configuration, current, bus, sample, timeout, identification,
+   observer, adc, break_input, temperature, deadline, user_stop
+@@ -83,6 +83,8 @@
+                  float maximum_current, float slew_hz_per_s, bool continuous = false,
+                  float startup_hz = 0);
+   bool set_speed_reference(float electrical_hz);
++  // Brake under observation, then short the phases at low speed before ready.
++  bool brake_speed();
+   bool speed_mode() const { return speed_mode_; }
+   SpeedLoop speed_loop{};
+   bool index_wheel(Limits limits, Parameters parameters, float current);
+--- a/Core/Inc/motor_speed.hpp
++++ b/Core/Inc/motor_speed.hpp
+@@ -4,7 +4,7 @@
+ 
+ namespace motor {
+ // Electrical-Hz speed PI, 1 kHz. The current loop remains at 20 kHz.
+-// Forward motoring only: zero torque on overspeed, no regenerative brake request.
++// Responsive UART mode permits bounded braking; legacy bench mode is motoring-only.
+ class SpeedLoop {
+  public:
+   static constexpr float period=.001f, kp=.015f, ki=.05f;
+@@ -25,15 +25,18 @@
+     integral_=output=std::clamp(seed_current,0.0f,limit);
+     engaged=true;
+   }
+-  bool step(float measured_hz) {
++  void brake() { requested=0; braking_=true; }
++  bool step(float measured_hz, bool allow_braking=false) {
+     if (!engaged || !observe(measured_hz)) return false;
+-    reference+=std::clamp(requested-reference,-slew*period,slew*period);
++    const float rate=braking_ ? 200.f : slew;
++    reference+=std::clamp(requested-reference,-rate*period,rate*period);
++    const float lower=allow_braking ? -std::min(limit,.6f) : 0.f;
+     const float error=reference-feedback;
+     const float trial=kp_*error+integral_;
+     // Conditional integration: never accumulate further into a current limit.
+-    if ((trial < limit || error < 0) && (trial > 0 || error > 0))
+-      integral_=std::clamp(integral_+ki_*period*error,0.0f,limit);
+-    output=std::clamp(kp_*error+integral_,0.0f,limit);
++    if ((trial < limit || error < 0) && (trial > lower || error > 0))
++      integral_=std::clamp(integral_+ki_*period*error,lower,limit);
++    output=std::clamp(kp_*error+integral_,lower,limit);
+     return true;
+   }
+   bool observe(float measured_hz) {
+@@ -45,5 +48,6 @@
+   bool engaged=false;
+  private:
+   float integral_=0, kp_=kp, ki_=ki;
++  bool braking_=false;
+ };
+ }
+--- a/Core/Inc/cart_direction.hpp
++++ b/Core/Inc/cart_direction.hpp
+@@ -30,6 +30,8 @@
+     // Repeated stop commands must not indefinitely extend the dwell.
+     if (active_) { stopped_at_ = now; active_ = false; }
+   }
++  // Caller must have completed controlled deceleration and low-speed settling.
++  void confirm_braked() { if (!active_) last_=0; }
+   bool accepts(float iq) const {
+     return active_ && std::isfinite(iq) &&
+         (iq == 0 || (iq > 0 ? 1 : -1) == direction);
+--- a/Core/Src/motor_control.cpp
++++ b/Core/Src/motor_control.cpp
+@@ -160,7 +160,7 @@
+ }
+ bool Controller::energized() const
+ {
+-  return state != State::idle && state != State::fault && state != State::identify_ready;
++  return state != State::idle && state != State::fault && state != State::identify_ready && state != State::ready;
+ }
+ void Controller::stop()
+ {
+@@ -237,6 +237,17 @@
+   return speed_mode_ && (state==State::closed || (responsive_speed_ &&
+       (state==State::align || state==State::ramp || state==State::blend))) && speed_loop.set_target(hz);
+ }
++bool Controller::brake_speed()
++{
++  if (!speed_mode_ || !responsive_speed_) return false;
++  if (state==State::decelerate || state==State::settle || state==State::ready) return true;
++  if (state!=State::closed && state!=State::align && state!=State::ramp && state!=State::blend) return false;
++  // During the bounded 8 RPM startup, a phase short is sufficient; no low-speed
++  // BEMF estimate is trusted. At speed, first decelerate with current control.
++  state=state==State::closed ? State::decelerate : State::settle;
++  speed_loop.brake(); ticks_=lost_lock_=0;
++  return true;
++}
+ bool Controller::index_wheel(Limits limits, Parameters p, float current)
+ {
+   if (hfi_mode_ != HfiMode::off || !std::isfinite(current) || current < .1f || current > .5f ||
+@@ -334,6 +345,16 @@
+   if (magnitude(current) > limits_.current) { trip(Fault::current); return {}; }
+   if (bus < limits_.bus_min || bus > limits_.bus_max) { trip(Fault::bus); return {}; }
+   ++ticks_;
++  if (state == State::settle) {
++    // Equal duties short the motor phases through the inverter. This stage is
++    // entered only below the startup speed or after observed deceleration.
++    current_reference={}; current_loop_.reset();
++    if (ticks_ >= 6000) {
++      state=State::ready; speed_loop.engaged=false;
++      speed_loop.feedback=speed_loop.reference=speed_loop.output=0;
++    }
++    return {};
++  }
+   if (state == State::hfi_probe) {
+     if (ticks_ >= probe_ticks_) { state = State::idle; return {}; }
+     const auto carrier = hfi_sampler_.injection();
+@@ -398,9 +419,20 @@
+   if (!energized()) return {};
+   if (speed_mode_ && ++speed_divider_ >= 20) {
+     speed_divider_=0;
+-    const bool valid=speed_loop.engaged ? speed_loop.step(estimated_omega/(2*pi)) :
++    const bool valid=speed_loop.engaged ? speed_loop.step(estimated_omega/(2*pi),responsive_speed_ && (state==State::closed || state==State::decelerate)) :
+         speed_loop.observe(estimated_omega/(2*pi));
+     if (!valid) { trip(Fault::sample); return {}; }
++  }
++  if (state==State::decelerate) {
++    if (observed && estimated_omega < 2*pi*12 && estimated_omega > 0) {
++      state=State::settle; ticks_=0; current_reference={}; return {};
++    }
++    lost_lock_=observed ? 0 : lost_lock_+1;
++    if (lost_lock_>400 || ticks_>60000) { trip(Fault::observer); return {}; }
++    current_reference={0,speed_loop.output};
++    const AB voltage=current_loop_.step(current,estimated_angle,current_reference,parameters,bus);
++    current_feedback=current_loop_.feedback;
++    return modulate(voltage,bus);
+   }
+   float angle = forced_angle_;
+   DQ target{0, target_iq_};
+@@ -491,6 +523,7 @@
+     case State::hfi_probe: return "hfi_probe";
+     case State::align: return "align"; case State::ramp: return "ramp";
+     case State::blend: return "blend"; case State::closed: return "closed";
++    case State::decelerate: return "decelerate"; case State::settle: return "settle"; case State::ready: return "ready";
+     case State::index: return "index";
+     default: return "fault";
+   }
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -56,6 +56,7 @@
+ motor::SerialCurrentReference serial_reference;
+ motor::CartDirection cart_direction;
+ motor::WheelCalibration wheel_calibration;
++float pending_wheel_rpm = 0;
+ bool wheel_mode = false; // latched PWM lock; only explicit "wheel exit" releases it
+ uint16_t wheel_raw[3]{};
+ uint32_t wheel_samples = 0, last_wheel_ms = 0, wheel_maximum_cycles = 0;
+@@ -91,6 +92,7 @@
+ }
+ void trip(motor::Fault reason)
+ {
++  pending_wheel_rpm=0;
+   disable_outputs();
+   if (controller.state != motor::State::fault) controller.trip(reason);
+   wheel_calibration.cancel();
+@@ -100,6 +102,7 @@
+ }
+ void stop_drive()
+ {
++  pending_wheel_rpm=0;
+   disable_outputs();
+   controller.stop();
+   wheel_calibration.cancel();
+@@ -428,6 +431,28 @@
+   return outputs_enabled;
+ }
+ 
++// Runs only in foreground. A neutral target leaves PWM off in ready; a new
++// target restarts without a blind dwell only after the controller has braked.
++void resume_braked_wheel()
++{
++  InterruptLock lock;
++  if (controller.state!=motor::State::ready || !controller.speed_mode() ||
++      pending_wheel_rpm==0 || outputs_enabled) return;
++  const uint32_t keepalive=last_keepalive_ms;
++  if (HAL_GetTick()-keepalive>200) { trip(motor::Fault::timeout); return; }
++  const float rpm=pending_wheel_rpm, current=controller.speed_loop.limit;
++  const float slew=controller.speed_loop.slew;
++  controller.stop(); cart_direction.confirm_braked();
++  const int direction=rpm>0 ? 1 : -1;
++  armed=true; armed_at=HAL_GetTick();
++  if (!cart_direction.begin(direction,HAL_GetTick()) ||
++      !controller.run_speed(limits,controller.parameters,
++        cfg::electrical_hz_from_wheel_rpm(std::abs(rpm)),current,slew,true,
++        cfg::electrical_hz_from_wheel_rpm(cfg::wheel_min_rpm)) || !enable_outputs())
++    trip(motor::Fault::configuration);
++  last_keepalive_ms=keepalive; // restarting cannot extend a dead host's lease
++}
++
+ void print_status(bool compact=false)
+ {
+   Measurements m;
+@@ -467,7 +492,7 @@
+   }
+   if (compact && speed_active) {
+     printf("state=%s fault=%s cal=%s n=%lu bus_mV=%ld MOE=%u CCER=0x%lx R_mOhm=%ld L_uH=%ld "
+-           "cart_protocol=3 speed_mode=1 uart_direction=%d req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld "
++           "cart_protocol=4 speed_mode=1 uart_direction=%d req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld "
+            "iq_max_mA=%ld slew_mrpm_s=%ld iq_mA=%ld peak_mA=%ld,%ld,%ld\r\n",
+            motor::name(state),motor::name(fault),m.calibrated ? "ok" : "pending",
+            static_cast<unsigned long>(m.samples),lroundf(m.bus*1000),(bdtr&TIM_BDTR_MOE)!=0,
+@@ -488,7 +513,7 @@
+          "drive_n=%lu peak_mA=%ld,%ld,%ld break_ready=%u break_sr=0x%lx break_comp=%lu "
+          "candidate_R_mOhm=%ld candidate_L_uH=%ld emf_mV=%ld pll_mrad=%ld start_mrad=%ld lock_n=%lu "
+          "adc_min_cnt=%u pwm_min_cnt=%u start_iq_min_mA=%ld uart_iq_active=%u "
+-         "uart_req_mA=%ld uart_iq_mA=%ld uart_direction=%d cart_protocol=3 "
++         "uart_req_mA=%ld uart_iq_mA=%ld uart_direction=%d cart_protocol=4 "
+          "speed_mode=%u req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld iq_max_mA=%ld engaged=%u slew_mrpm_s=%ld\r\n",
+          motor::name(state), motor::name(fault),
+          m.calibrated ? "ok" : (m.calibration_failed ? "failed" : "pending"),
+@@ -660,9 +685,9 @@
+ void command(char *line)
+ {
+   if (!strcmp(line, "cartcap")) {
+-    printf("cart_protocol=3 signed_iq=1 signed_rpm=1 continuous_speed=1 reverse_dwell_ms=2000 watchdog_ms=500 "
+-           "bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld max_speed_iq_mA=2000 phase_trip_mA=%ld min_mrpm=8000 max_mrpm=15000 "
+-           "startup_mA=600 slew_mrpm_s=10000 max_slew_mrpm_s=20000 startup_target_mrpm=8000 live_target=1\r\n",
++    printf("cart_protocol=4 signed_iq=1 signed_rpm=1 continuous_speed=1 controlled_reverse=1 controlled_zero=1 reverse_dwell_ms=2000 watchdog_ms=500 "
++           "bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld max_speed_iq_mA=2000 phase_trip_mA=%ld min_mrpm=8000 max_mrpm=25000 "
++           "startup_mA=600 slew_mrpm_s=20000 max_slew_mrpm_s=20000 startup_target_mrpm=8000 live_target=1\r\n",
+            lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),
+            lroundf(cfg::pot_maximum_iq*1000), lroundf(limits.current*1000));
+     return;
+@@ -679,7 +704,7 @@
+            "runiq signed_electrical_Hz startup_A signed_Iq_A | iq signed_Iq_A (0=stop; direction change requires stop+dwell) | "
+            "hfitest V seconds | hfistatus | wheel start turns | wheel finish | wheel exit | wheelstatus | "
+            "index A (398 electrical cycles) | indexstatus | runrpm signed_wheel_RPM Imax_A [accel_RPM_s] (0.1..2 A, 1..20 RPM/s) | "
+-           "rpm signed_wheel_RPM (magnitude 8..15, 0=PWM stop) | speedstatus | ping\r\n"); return;
++           "rpm signed_wheel_RPM (magnitude 8..25, 0=controlled stop) | speedstatus | ping\r\n"); return;
+   }
+   if (!strcmp(line, "stop")) {
+     InterruptLock lock; stop_drive(); return;
+@@ -699,15 +724,19 @@
+     bool accepted=false;
+     if (parse_numbers(line+4,value,1)) {
+       InterruptLock lock;
+-      if (outputs_enabled && controller.speed_mode()) {
+-        if (value[0]==0) { stop_drive(); accepted=true; }
+-        else if (cart_direction.accepts(value[0]) && std::abs(value[0])>=cfg::wheel_min_rpm &&
+-                 std::abs(value[0])<=cfg::wheel_max_rpm)
+-          accepted=controller.set_speed_reference(cfg::electrical_hz_from_wheel_rpm(std::abs(value[0])));
++      if (controller.speed_mode() && (outputs_enabled || controller.state==motor::State::ready)) {
++        if (value[0]==0 || (std::abs(value[0])>=cfg::wheel_min_rpm && std::abs(value[0])<=cfg::wheel_max_rpm)) {
++          const auto state=controller.state;
++          if (value[0]==0 || !cart_direction.accepts(value[0]) ||
++              state==motor::State::decelerate || state==motor::State::settle || state==motor::State::ready)
++            accepted=controller.brake_speed();
++          else accepted=controller.set_speed_reference(cfg::electrical_hz_from_wheel_rpm(std::abs(value[0])));
++          if (accepted) pending_wheel_rpm=value[0];
++        }
+       }
+     }
+     if (accepted) printf("OK wheel_target_mrpm=%ld\r\n",lroundf(value[0]*1000));
+-    else printf("ERR rpm requires active runrpm in same direction; magnitude 8..15 RPM; fault=%s\r\n",
++    else printf("ERR rpm requires active runrpm; magnitude 8..25 RPM; fault=%s\r\n",
+                 motor::name(controller.fault));
+     return;
+   }
+@@ -817,6 +846,7 @@
+         serial_reference.reset();
+         pot_mode = false;
+         if (runrpm) {
++          pending_wheel_rpm=value[0];
+           accepted=std::abs(value[0])>=cfg::wheel_min_rpm && std::abs(value[0])<=cfg::wheel_max_rpm &&
+               value[1]>=.1f && value[1]<=cfg::wheel_maximum_iq && value[2]>=1 && value[2]<=cfg::wheel_max_slew_rpm_per_s &&
+               controller.run_speed(limits,controller.parameters,cfg::electrical_hz_from_wheel_rpm(std::abs(value[0])),
+@@ -994,7 +1024,7 @@
+     wheel_calibration.cancel(motor::WheelCalibration::Error::sample_gap);
+   if (outputs_enabled && (HAL_GetTick() - measurement.last_fast_ms > 2 ||
+       HAL_GetTick() - measurement.last_slow_ms > 5)) trip(motor::Fault::deadline);
+-  if (outputs_enabled && HAL_GetTick() - last_keepalive_ms > 500) trip(motor::Fault::timeout);
++  if ((outputs_enabled || controller.speed_mode()) && HAL_GetTick() - last_keepalive_ms > 500) trip(motor::Fault::timeout);
+   if (!cfg::enable_power_stage) disable_outputs();
+ }
+ // Override CubeMX's weak _write: printf uses the library's nonblocking DMA
+@@ -1042,6 +1072,7 @@
+   uint32_t button_changed = last_report;
+   bool button_raw = false, button_stable = false;
+   while (true) {
++    resume_braked_wheel();
+     process_hfi();
+     finish_identification();
+     const uint32_t previous_rx_errors = console.rx_error_count();
+@@ -1074,7 +1105,7 @@
+     motor::Fault report_fault;
+     { InterruptLock lock; report_fault=controller.fault; }
+     if (report_fault != last_reported_fault ||
+-        now - last_report >= (outputs_enabled ? 100U : (wheel_mode ? 500U : 1000U))) {
++        now - last_report >= ((outputs_enabled || controller.speed_mode()) ? 100U : (wheel_mode ? 500U : 1000U))) {
+       last_report = now; last_reported_fault=report_fault;
+       if (wheel_mode) print_wheel_status();
+       else print_status(report_fault == motor::Fault::none);

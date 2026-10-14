@@ -1,0 +1,237 @@
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -9,6 +9,7 @@
+ #include "motor_math.hpp"
+ #include "pot_current_reference.hpp"
+ #include "serial_current_reference.hpp"
++#include "cart_direction.hpp"
+ #include "wheel_calibration.hpp"
+ #include "stm32g4xx_ll_adc.h"
+ #include "stm32_library/peripherals/Inc/dma_analog_in.hpp"
+@@ -53,6 +54,7 @@
+                      cfg::bench_phase_trip, cfg::bench_identify_voltage};
+ motor::PotCurrentReference pot_reference;
+ motor::SerialCurrentReference serial_reference;
++motor::CartDirection cart_direction;
+ motor::WheelCalibration wheel_calibration;
+ bool wheel_mode = false; // latched PWM lock; only explicit "wheel exit" releases it
+ uint16_t wheel_raw[3]{};
+@@ -85,6 +87,7 @@
+   CLEAR_BIT(TIM1->BDTR, TIM_BDTR_MOE);
+   CLEAR_BIT(TIM1->CCER, phase_enable);
+   outputs_enabled = false;
++  cart_direction.stop(HAL_GetTick());
+ }
+ void trip(motor::Fault reason)
+ {
+@@ -437,6 +440,7 @@
+   float pot_requested, pot_iq;
+   float serial_requested, serial_iq;
+   bool serial_active;
++  int serial_direction;
+   motor::DQ reference, feedback;
+   bool reverse, ready;
+   uint32_t bdtr, ccer;
+@@ -452,6 +456,9 @@
+     pot_requested = pot_reference.requested; pot_iq = pot_reference.current;
+     serial_requested = serial_reference.requested; serial_iq = serial_reference.current;
+     serial_active = serial_reference.active();
++    serial_direction = cart_direction.direction;
++    serial_requested *= serial_direction; serial_iq *= serial_direction;
++    if (serial_active) hz *= serial_direction;
+     reference = controller.current_reference; feedback = controller.current_feedback;
+     reverse = pot_reference.reversed(); ready = protection_ready;
+     bdtr = TIM1->BDTR; ccer = TIM1->CCER;
+@@ -464,7 +471,7 @@
+          "drive_n=%lu peak_mA=%ld,%ld,%ld break_ready=%u break_sr=0x%lx break_comp=%lu "
+          "candidate_R_mOhm=%ld candidate_L_uH=%ld emf_mV=%ld pll_mrad=%ld start_mrad=%ld lock_n=%lu "
+          "adc_min_cnt=%u pwm_min_cnt=%u start_iq_min_mA=%ld uart_iq_active=%u "
+-         "uart_req_mA=%ld uart_iq_mA=%ld\r\n",
++         "uart_req_mA=%ld uart_iq_mA=%ld uart_direction=%d cart_protocol=1\r\n",
+          motor::name(state), motor::name(fault),
+          m.calibrated ? "ok" : (m.calibration_failed ? "failed" : "pending"),
+          static_cast<unsigned long>(m.samples), static_cast<unsigned long>(m.regular_samples),
+@@ -488,7 +495,7 @@
+          lroundf(candidate.resistance * 1000), lroundf(candidate.inductance * 1e6f),
+          lroundf(emf * 1000), lroundf(pll_error * 1000), lroundf(startup_error * 1000), lock_samples,
+          m.adc_entry_min, m.pwm_write_min, lroundf(startup_iq_minimum * 1000),
+-         serial_active, lroundf(serial_requested*1000), lroundf(serial_iq*1000));
++         serial_active, lroundf(serial_requested*1000), lroundf(serial_iq*1000), serial_direction);
+ }
+ void finish_identification()
+ {
+@@ -630,16 +637,23 @@
+ }
+ void command(char *line)
+ {
++  if (!strcmp(line, "cartcap")) {
++    printf("cart_protocol=1 signed_iq=1 reverse_dwell_ms=2000 watchdog_ms=500 "
++           "bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld\r\n",
++           lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),
++           lroundf(cfg::pot_maximum_iq*1000));
++    return;
++  }
+   if (!strcmp(line, "status")) { print_status(); return; }
+   if (!strcmp(line, "hfistatus")) { print_hfi_status(); return; }
+   if (!strcmp(line, "wheelstatus")) { print_wheel_status(); return; }
+   if (!strcmp(line, "indexstatus")) { print_index_status(); return; }
+   if (!strcmp(line, "speedstatus")) { print_speed_status(); return; }
+   if (!strcmp(line, "help")) {
+-    printf("status | timing | mathcheck | zero | stop | limits Vmin Vmax Iphase_max Vid | params R_ohm L_H | "
++    printf("cartcap | status | timing | mathcheck | zero | stop | limits Vmin Vmax Iphase_max Vid | params R_ohm L_H | "
+            "potzero | breaktest | arm | identify | run electrical_Hz startup_A | "
+            "runpot electrical_Hz startup_A | hfi off | hfi monitor V | hfi assist V | "
+-           "runiq electrical_Hz startup_A Iq_A | iq Iq_A (0=stop) | "
++           "runiq signed_electrical_Hz startup_A signed_Iq_A | iq signed_Iq_A (0=stop; direction change requires stop+dwell) | "
+            "hfitest V seconds | hfistatus | wheel start turns | wheel finish | wheel exit | wheelstatus | "
+            "index A (398 electrical cycles) | indexstatus | runrpm wheel_RPM Imax_A | "
+            "rpm wheel_RPM (8..15, 0=PWM stop) | speedstatus | ping\r\n"); return;
+@@ -673,11 +687,12 @@
+     bool accepted = false;
+     if (parse_numbers(line+3, value, 1)) {
+       InterruptLock lock;
+-      accepted = outputs_enabled && serial_reference.set_target(value[0]);
++      accepted = outputs_enabled && cart_direction.accepts(value[0]) &&
++          serial_reference.set_target(std::abs(value[0]));
+       if (accepted && value[0] == 0) stop_drive();
+     }
+     if (accepted) printf("OK iq_target_mA=%ld\r\n", lroundf(value[0]*1000));
+-    else printf("ERR iq requires active runiq; range 0..1 A\r\n");
++    else printf("ERR iq requires active runiq; magnitude 0..1 A; direction change requires stop\r\n");
+     return;
+   }
+   if (outputs_enabled) { printf("ERR stop first\r\n"); return; }
+@@ -766,30 +781,35 @@
+     bool accepted;
+     {
+       InterruptLock lock;
+-      serial_reference.reset();
+-      pot_mode = false;
+-      if (runrpm) {
+-        accepted=value[0]>=cfg::wheel_min_rpm && value[0]<=cfg::wheel_max_rpm &&
+-            value[1]>=.1f && value[1]<=.5f &&
+-            controller.run_speed(limits,controller.parameters,cfg::electrical_hz_from_wheel_rpm(value[0]),
+-                                 value[1],cfg::electrical_hz_from_wheel_rpm(cfg::wheel_slew_rpm_per_s));
+-      } else if (runpot) {
+-        // Permit setting a small current while stopped, then explicitly
+-        // starting. Reject a knob position above the selected startup current
+-        // so handover cannot unexpectedly request more than the initial test.
+-        accepted = pot_reference.requested <= value[1] &&
+-            controller.run_current(limits, controller.parameters, value[0], value[1], cfg::pot_maximum_iq);
+-        if (accepted) { pot_reference.reset(); pot_mode = true; }
+-      } else if (runiq) {
+-        accepted = serial_reference.start(value[2], value[1], cfg::pot_maximum_iq) &&
+-            controller.run_current(limits, controller.parameters, value[0], value[1], cfg::pot_maximum_iq);
+-      } else {
++      const int direction = runiq ? motor::CartDirection::start_direction(value[0], value[2]) : 1;
++      accepted = cart_direction.begin(direction, HAL_GetTick());
++      if (accepted) {
++        serial_reference.reset();
+         pot_mode = false;
+-        accepted = index ? controller.index_wheel(limits,controller.parameters,value[0]) :
+-            (identify ? controller.identify(limits) : (hfitest ?
+-            controller.probe_hfi(limits,controller.parameters,value[0],value[1]) :
+-            controller.run(limits, controller.parameters, value[0], value[1])));
+-      }
++        if (runrpm) {
++          accepted=value[0]>=cfg::wheel_min_rpm && value[0]<=cfg::wheel_max_rpm &&
++              value[1]>=.1f && value[1]<=.5f &&
++              controller.run_speed(limits,controller.parameters,cfg::electrical_hz_from_wheel_rpm(value[0]),
++                                   value[1],cfg::electrical_hz_from_wheel_rpm(cfg::wheel_slew_rpm_per_s));
++        } else if (runpot) {
++          // Permit setting a small current while stopped, then explicitly
++          // starting. Reject a knob position above the selected startup current
++          // so handover cannot unexpectedly request more than the initial test.
++          accepted = pot_reference.requested <= value[1] &&
++              controller.run_current(limits, controller.parameters, value[0], value[1], cfg::pot_maximum_iq);
++          if (accepted) { pot_reference.reset(); pot_mode = true; }
++        } else if (runiq) {
++          accepted = controller.hfi_mode() == motor::HfiMode::off &&
++              serial_reference.start(std::abs(value[2]), value[1], cfg::pot_maximum_iq) &&
++              controller.run_current(limits, controller.parameters, std::abs(value[0]), value[1], cfg::pot_maximum_iq);
++        } else {
++          pot_mode = false;
++          accepted = index ? controller.index_wheel(limits,controller.parameters,value[0]) :
++              (identify ? controller.identify(limits) : (hfitest ?
++              controller.probe_hfi(limits,controller.parameters,value[0],value[1]) :
++              controller.run(limits, controller.parameters, value[0], value[1])));
++        }
++    }
+     }
+     if (!accepted || !enable_outputs()) {
+       InterruptLock lock; trip(motor::Fault::configuration);
+@@ -885,7 +905,8 @@
+       }
+       if (serial_reference.active() && !controller.set_current_reference(serial_reference.current))
+         trip(motor::Fault::configuration);
+-      const motor::AB current = motor::clarke(measurement.current[0], measurement.current[1], measurement.current[2]);
++      const motor::AB current = motor::cart_current(measurement.current[0], measurement.current[1],
++                                                    measurement.current[2], cart_direction.direction);
+       // DMA capture confirms bottom updates. Approximate the ADC-to-ADC
+       // interval by equal halves of the neighboring PWM patterns (trigger is
+       // 1.47 us before the peak). Inverter dead-time/drop is not compensated.
+@@ -909,9 +930,10 @@
+         // for the three writes; never silently defer a duty by one PWM period.
+         trip(motor::Fault::deadline);
+       } else {
+-        TIM1->CCR1 = static_cast<uint32_t>(duty.u * cfg::pwm_period);
+-        TIM1->CCR2 = static_cast<uint32_t>(duty.v * cfg::pwm_period);
+-        TIM1->CCR3 = static_cast<uint32_t>(duty.w * cfg::pwm_period);
++        const motor::Duty physical = motor::cart_duty(duty, cart_direction.direction);
++        TIM1->CCR1 = static_cast<uint32_t>(physical.u * cfg::pwm_period);
++        TIM1->CCR2 = static_cast<uint32_t>(physical.v * cfg::pwm_period);
++        TIM1->CCR3 = static_cast<uint32_t>(physical.w * cfg::pwm_period);
+       }
+       // Accumulate demodulation only after the time-critical preload writes.
+       // The matrix solve/PLL runs in the foreground, not this 20 kHz interrupt.
+--- /dev/null
++++ b/Core/Inc/cart_direction.hpp
+@@ -0,0 +1,48 @@
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include "motor_control.hpp"
++
++namespace motor {
++// Keep the proven positive-speed observer in a virtual U/V/W frame. Reflect
++// BOTH sensing and actuation for reverse: U/V/W physical -> U/W/V virtual.
++// The previous/queued duty used by the observer stays in the virtual frame.
++inline AB cart_current(float u, float v, float w, int direction) {
++  return direction < 0 ? clarke(u, w, v) : clarke(u, v, w);
++}
++inline Duty cart_duty(Duty virtual_duty, int direction) {
++  if (direction < 0) return {virtual_duty.u, virtual_duty.w, virtual_duty.v};
++  return virtual_duty;
++}
++
++class CartDirection {
++ public:
++  static constexpr uint32_t reverse_dwell_ms = 2000;
++  bool begin(int requested, uint32_t now) {
++    if ((requested != 1 && requested != -1) || active_) return false;
++    if (last_ && requested != last_ && now - stopped_at_ < reverse_dwell_ms) return false;
++    direction = last_ = requested;
++    active_ = true;
++    return true;
++  }
++  void stop(uint32_t now) {
++    // Repeated stop commands must not indefinitely extend the dwell.
++    if (active_) { stopped_at_ = now; active_ = false; }
++  }
++  bool accepts(float iq) const {
++    return active_ && std::isfinite(iq) &&
++        (iq == 0 || (iq > 0 ? 1 : -1) == direction);
++  }
++  static int start_direction(float hz, float iq) {
++    if (!std::isfinite(hz) || !std::isfinite(iq) || hz == 0 || iq == 0 ||
++        (hz > 0) != (iq > 0)) return 0;
++    return hz > 0 ? 1 : -1;
++  }
++  int direction = 1;
++ private:
++  int last_ = 0;
++  bool active_ = false;
++  uint32_t stopped_at_ = 0;
++};
++}

@@ -1,0 +1,29 @@
+{
+  "gamepad": null,
+  "baudrate": 115200,
+  "left_motor": {
+    "resistance_ohm": null,
+    "inductance_h": null
+  },
+  "right_motor": {
+    "resistance_ohm": null,
+    "inductance_h": null
+  },
+  "drive": {
+    "max_current_a": 2.0,
+    "deadzone": 0.12,
+    "input_timeout_s": 0.5,
+    "loop_timeout_s": 0.15,
+    "left_sign": 1,
+    "right_sign": -1,
+    "min_speed_rpm": 8.0,
+    "max_speed_rpm": 25.0,
+    "acceleration_rpm_s": 20.0,
+    "steering_gain": 1.5,
+    "observer_retry_limit": 3,
+    "observer_retry_delay_s": 2.5
+  },
+  "left_serial": "0670FF343433464757213550",
+  "right_serial": "0665FF535157808667132326",
+  "connect_timeout_s": 5.0
+}
