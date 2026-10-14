@@ -205,6 +205,7 @@ class Wheel:
         self.clearing_observer = False
 
     def receive(self, now: float):
+        observed_fault = None
         for line in self.port.read_lines():
             if line.startswith("ERR") or line == "drive=rejected":
                 raise EscError(f"{self.port.path}: {line}")
@@ -223,7 +224,13 @@ class Wheel:
                     # stop. It must not spend another retry or hide other faults.
                     if self.phase == "stopping" and self.clearing_observer and fault.recoverable:
                         continue
-                    raise fault
+                    # Drain the whole already-read batch: a later hard fault
+                    # must take precedence over an earlier observer fault.
+                    if observed_fault is None or not fault.recoverable:
+                        observed_fault = fault
+                    continue
+                if observed_fault is not None:
+                    continue
                 if self.phase == "stopping" and status["state"] == "idle" and status["MOE"] == "0":
                     check_stopped(status)
                     self.phase = "stopped"
@@ -252,6 +259,8 @@ class Wheel:
                 if int(line.split("=", 1)[1]) != self.pending_rpm:
                     raise EscError(f"{self.port.path}: wrong speed acknowledgment")
                 self.pending_rpm = None
+        if observed_fault is not None:
+            raise observed_fault
 
     def update(self, target_rpm: float, now: float, *, enabled=True):
         cfg = self.config.drive

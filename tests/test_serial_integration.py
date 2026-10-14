@@ -25,6 +25,8 @@ class Firmware:
         self.commands = []
         self.timeline = []
         self.running = False
+        self.fault = 'none'
+        self.inject_observer = threading.Event()
         self.direction = 1
         self.count = 0
         self.resistance_mohm = 1911
@@ -44,7 +46,10 @@ class Firmware:
 
     def report(self):
         self.count += 2000
-        self.line(status("closed" if self.running else "idle", count=self.count, direction=self.direction,
+        self.line(status("fault" if self.fault != 'none' else "closed" if self.running else "idle",
+                         fault=self.fault, MOE='1' if self.running else '0',
+                         CCER='0x555' if self.running else '0x0',
+                         count=self.count, direction=self.direction,
                          R_mOhm=str(self.resistance_mohm), L_uH=str(self.inductance_uh),
                          cart_protocol=str(self.protocol), slew_mrpm_s=str(round(self.acceleration*1000))))
 
@@ -52,6 +57,10 @@ class Firmware:
         buffer = b""
         last_report = time.monotonic()
         while not self.ending.is_set():
+            if self.inject_observer.is_set():
+                self.inject_observer.clear()
+                self.running, self.fault = False, 'observer_lock'
+                self.report()
             if select.select([self.master], [], [], .01)[0]:
                 data = os.read(self.master, 4096).replace(b"\x03", b"")
                 buffer += data
@@ -70,6 +79,7 @@ class Firmware:
                         self.line("calibration=started")
                     elif command == "stop":
                         self.running = False
+                        self.fault = 'none'
                     elif command == "status":
                         self.report()
                     elif command.startswith("params "):
@@ -111,6 +121,43 @@ class Firmware:
 
 
 class SerialIntegrationTests(unittest.TestCase):
+    def test_observer_recovery_over_fragmented_uart_uses_latest_command(self):
+        boards = [Firmware(), Firmware()]
+        pair = None
+        try:
+            pair = EscPair(Config(DriveSettings(), left_port=boards[0].path, right_port=boards[1].path))
+
+            def drive_for(seconds, output):
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    pair.update(output, time.monotonic())
+                    time.sleep(.02)
+
+            drive_for(.3, Output(15, -15, True))
+            self.assertTrue(all(b.running for b in boards))
+            failed_at = time.monotonic()
+            boards[0].inject_observer.set()
+            drive_for(.3, Output(15, -15, True))
+            self.assertFalse(any(b.running for b in boards))
+            self.assertEqual(pair.retry_count, 1)
+            drive_for(2.4, Output(-12, 9, True))
+            self.assertTrue(all(b.running for b in boards))
+            self.assertEqual([b.direction for b in boards], [-1, 1])
+            for board, target in zip(boards, (-12, 9)):
+                starts = [(at, cmd) for at, cmd in board.timeline if cmd.startswith('runrpm ')]
+                self.assertEqual(len(starts), 2)
+                self.assertGreaterEqual(starts[1][0] - failed_at, 2.5)
+                self.assertEqual(starts[1][1], f'runrpm {target:.3f} 2 20')
+                self.assertTrue(any(cmd == 'stop' and starts[0][0] < at < starts[1][0]
+                                    for at, cmd in board.timeline))
+            drive_for(.1, Output())
+            self.assertFalse(any(b.running for b in boards))
+        finally:
+            if pair:
+                pair.close()
+            for board in boards:
+                board.close()
+
     def test_protocol_two_cannot_start_with_responsive_host(self):
         boards = [Firmware(protocol=2), Firmware()]
         try:

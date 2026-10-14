@@ -158,6 +158,15 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(EscFault, 'bus'):
             self.tick()
 
+    def test_later_hard_fault_in_same_read_batch_prevents_recovery(self):
+        self.boards[0].fail()
+        self.boards[0].lines.append(self.boards[0].snapshot())
+        self.boards[0].fail('current')
+        with self.assertRaisesRegex(EscFault, 'current'):
+            self.tick()
+        self.assertEqual(self.pair.retry_count, 0)
+        self.assertEqual(self.pair.fault_events[0]['status']['fault'], 'current')
+
     def test_old_observer_frame_does_not_spend_second_retry(self):
         self.boards[0].fail()
         self.tick()
@@ -185,10 +194,12 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(EscError, 'rebooted'):
             self.tick()
 
-    def test_recovery_requires_pwm_off_and_can_be_disabled(self):
+    def test_recovery_requires_pwm_off(self):
         self.boards[0].lines.append(self.boards[0].snapshot(state='fault', fault='observer_lock', MOE='1'))
         with self.assertRaises(EscFault):
             self.tick()
+
+    def test_recovery_can_be_disabled(self):
         self.pair.config = Config(DriveSettings(observer_retry_limit=0))
         self.boards[0].fail()
         with self.assertRaises(EscFault):
