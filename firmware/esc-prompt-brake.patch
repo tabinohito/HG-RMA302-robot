@@ -1,0 +1,56 @@
+--- a/Core/Inc/motor_speed.hpp
++++ b/Core/Inc/motor_speed.hpp
+@@ -14,11 +14,14 @@
+         !std::isfinite(slew_hz_per_s) || slew_hz_per_s <= 0 || slew_hz_per_s > 100) return false;
+     *this=SpeedLoop{}; requested=reference=hz; limit=maximum_current; slew=slew_hz_per_s;
+     maximum_hz_=responsive ? 360.f : 100.f;
++    responsive_=responsive;
+     kp_=responsive ? .04f : kp; ki_=responsive ? .2f : ki;
+     return true;
+   }
+   bool set_target(float hz) {
+     if (!std::isfinite(hz) || hz < 10 || hz > maximum_hz_ || limit <= 0) return false;
++    if(responsive_ && engaged && hz<requested)
++      reference=std::min(reference,std::max(hz,std::max(0.f,feedback)));
+     requested=hz; return true;
+   }
+   void engage(float measured_hz,float seed_current) {
+@@ -26,10 +29,17 @@
+     integral_=output=std::clamp(seed_current,0.0f,limit);
+     engaged=true;
+   }
+-  void brake() { requested=0; braking_=true; }
++  void brake() {
++    requested=0; braking_=true;
++    // At a voltage limit the ramp reference can be 100 wheel RPM while the
++    // rotor is only doing 31. Do not keep motoring while unwinding that gap.
++    reference=std::min(reference,std::max(0.f,feedback));
++    integral_=std::min(integral_,0.f);
++    output=std::min(output,0.f);
++  }
+   bool step(float measured_hz, bool allow_braking=false) {
+     if (!engaged || !observe(measured_hz)) return false;
+-    const float rate=braking_ ? 200.f : slew;
++    const float rate=(braking_ || (allow_braking && requested<reference)) ? 200.f : slew;
+     reference+=std::clamp(requested-reference,-rate*period,rate*period);
+     const float lower=allow_braking ? -std::min(limit,.6f) : 0.f;
+     const float error=reference-feedback;
+@@ -50,6 +60,7 @@
+  private:
+   float integral_=0, kp_=kp, ki_=ki;
+   float maximum_hz_=100;
++  bool responsive_=false;
+   bool braking_=false;
+ };
+ }
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -767,7 +767,7 @@
+   if (configure_cart(line)) return;
+   if (!strcmp(line, "cartcap")) {
+     printf("cart_protocol=4 signed_iq=1 signed_rpm=1 continuous_speed=1 controlled_reverse=1 controlled_zero=1 reverse_dwell_ms=2000 watchdog_ms=500 "
+-           "config_protocol=1 supported_max_mrpm=100000 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
++           "config_protocol=1 supported_max_mrpm=100000 brake_from_feedback=1 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
+            "max_speed_iq_mA=%lu min_mrpm=%lu max_mrpm=%lu startup_mA=%lu slew_mrpm_s=%lu "
+            "max_slew_mrpm_s=%lu startup_target_mrpm=%lu live_target=1\r\n",
+            lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),

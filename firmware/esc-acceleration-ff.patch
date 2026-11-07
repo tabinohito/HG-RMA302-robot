@@ -1,0 +1,195 @@
+--- a/Core/Inc/motor_speed.hpp
++++ b/Core/Inc/motor_speed.hpp
+@@ -8,29 +8,35 @@
+ class SpeedLoop {
+  public:
+   static constexpr float period=.001f, kp=.015f, ki=.05f;
+-  bool start(float hz,float maximum_current,float slew_hz_per_s,bool responsive=false) {
++  bool start(float hz,float maximum_current,float slew_hz_per_s,bool responsive=false,float acceleration_ff=0) {
+     if (!std::isfinite(hz) || hz < 10 || hz > (responsive ? 360.f : 100.f) ||
+         !std::isfinite(maximum_current) || maximum_current <= 0 || maximum_current > 2 ||
+-        !std::isfinite(slew_hz_per_s) || slew_hz_per_s <= 0 || slew_hz_per_s > 100) return false;
++        !std::isfinite(slew_hz_per_s) || slew_hz_per_s <= 0 || slew_hz_per_s > 100 ||
++        !std::isfinite(acceleration_ff) || acceleration_ff < 0 || acceleration_ff > 1) return false;
+     *this=SpeedLoop{}; requested=reference=hz; limit=maximum_current; slew=slew_hz_per_s;
+     maximum_hz_=responsive ? 360.f : 100.f;
+     responsive_=responsive;
++    ff_limit_=responsive ? std::min(acceleration_ff,maximum_current) : 0.f;
+     kp_=responsive ? .04f : kp; ki_=responsive ? .2f : ki;
+     return true;
+   }
+   bool set_target(float hz) {
+     if (!std::isfinite(hz) || hz < 10 || hz > maximum_hz_ || limit <= 0) return false;
+-    if(responsive_ && engaged && hz<requested)
++    if(responsive_ && engaged && hz<requested) {
+       reference=std::min(reference,std::max(hz,std::max(0.f,feedback)));
++      feedforward=0;
++    }
+     requested=hz; return true;
+   }
+   void engage(float measured_hz,float seed_current) {
+     feedback=reference=measured_hz;
+     integral_=output=std::clamp(seed_current,0.0f,limit);
++    feedforward=0;
+     engaged=true;
+   }
+   void brake() {
+     requested=0; braking_=true;
++    feedforward=0;
+     // At a voltage limit the ramp reference can be 100 wheel RPM while the
+     // rotor is only doing 31. Do not keep motoring while unwinding that gap.
+     reference=std::min(reference,std::max(0.f,feedback));
+@@ -40,14 +46,23 @@
+   bool step(float measured_hz, bool allow_braking=false) {
+     if (!engaged || !observe(measured_hz)) return false;
+     const float rate=(braking_ || (allow_braking && requested<reference)) ? 200.f : slew;
++    const float previous_reference=reference;
+     reference+=std::clamp(requested-reference,-rate*period,rate*period);
++    // Feed forward the bounded reference acceleration, not a raw joystick step.
++    // Average 50 Hz UART stair steps at 1 kHz; never retain positive FF through
++    // a reduction/brake or use FF to skip sensorless acquisition.
++    if (!allow_braking || braking_ || requested<previous_reference) feedforward=0;
++    else {
++      const float ff=ff_limit_*std::clamp((reference-previous_reference)/(period*slew),0.f,1.f);
++      feedforward+=(period/(.03f+period))*(ff-feedforward);
++    }
+     const float lower=allow_braking ? -std::min(limit,.6f) : 0.f;
+     const float error=reference-feedback;
+-    const float trial=kp_*error+integral_;
++    const float trial=kp_*error+integral_+feedforward;
+     // Conditional integration: never accumulate further into a current limit.
+     if ((trial < limit || error < 0) && (trial > lower || error > 0))
+       integral_=std::clamp(integral_+ki_*period*error,lower,limit);
+-    output=std::clamp(kp_*error+integral_,lower,limit);
++    output=std::clamp(kp_*error+integral_+feedforward,lower,limit);
+     return true;
+   }
+   bool observe(float measured_hz) {
+@@ -55,12 +70,13 @@
+     feedback+=(period/(.03f+period))*(measured_hz-feedback);
+     return true;
+   }
+-  float requested=0,reference=0,feedback=0,output=0,limit=0,slew=0;
++  float requested=0,reference=0,feedback=0,output=0,limit=0,slew=0,feedforward=0;
+   bool engaged=false;
+  private:
+   float integral_=0, kp_=kp, ki_=ki;
+   float maximum_hz_=100;
+   bool responsive_=false;
+   bool braking_=false;
++  float ff_limit_=0;
+ };
+ }
+--- a/Core/Inc/cart_settings.hpp
++++ b/Core/Inc/cart_settings.hpp
+@@ -9,7 +9,7 @@
+   X(bus_min_mv, 18000) X(bus_max_mv, 26000) X(phase_trip_ma, 4000) \
+   X(ntc_trip_raw, 2873) X(wheel_cycles_milli, 199000) \
+   X(min_mrpm, 8000) X(max_mrpm, 25000) X(max_iq_ma, 2000) X(max_slew_mrpm_s, 20000) \
+-  X(startup_mrpm, 8000) X(startup_ma, 600) \
++  X(startup_mrpm, 8000) X(startup_ma, 600) X(accel_ff_ma, 0) \
+   X(sum_soft_ma, 1200) X(sum_hard_ma, 2000) X(sum_trip_samples, 10) \
+   X(lock_bad_cost, 5) X(lock_score, 2000) \
+   X(overspeed_filtered_milli, 1500) X(overspeed_raw_milli, 3000)
+@@ -18,7 +18,7 @@
+ #define FIELD(name, initial) uint32_t name = initial;
+   CART_SETTINGS_FIELDS(FIELD)
+ #undef FIELD
+-  static constexpr unsigned field_count = 18;
++  static constexpr unsigned field_count = 19;
+   static const char* key(unsigned index) {
+     static const char* const keys[] = {
+ #define KEY(name, initial) #name,
+@@ -51,6 +51,7 @@
+         max_slew_mrpm_s>=1000 && max_slew_mrpm_s<=20000 &&
+         startup_mrpm>=8000 && startup_mrpm<=min_mrpm &&
+         startup_ma>=100 && startup_ma<=1000 && startup_ma*2<=phase_trip_ma &&
++        accel_ff_ma<=1000 &&
+         uint64_t(startup_mrpm)*wheel_cycles_milli>=600000000ULL &&
+         uint64_t(max_mrpm)*wheel_cycles_milli<=21600000000ULL &&
+         uint64_t(max_slew_mrpm_s)*wheel_cycles_milli<=6000000000ULL &&
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -515,7 +515,7 @@
+   if (compact && speed_active) {
+     printf("state=%s fault=%s cal=%s n=%lu bus_mV=%ld MOE=%u CCER=0x%lx R_mOhm=%ld L_uH=%ld "
+            "cart_protocol=4 speed_mode=1 uart_direction=%d req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld "
+-           "iq_max_mA=%ld slew_mrpm_s=%ld iq_mA=%ld peak_mA=%ld,%ld,%ld config_id=%lu\r\n",
++           "iq_max_mA=%ld slew_mrpm_s=%ld iq_mA=%ld ff_mA=%ld peak_mA=%ld,%ld,%ld config_id=%lu\r\n",
+            motor::name(state),motor::name(fault),m.calibrated ? "ok" : "pending",
+            static_cast<unsigned long>(m.samples),lroundf(m.bus*1000),(bdtr&TIM_BDTR_MOE)!=0,
+            static_cast<unsigned long>(ccer),lroundf(p.resistance*1000),lroundf(p.inductance*1e6f),
+@@ -523,7 +523,7 @@
+            lroundf(serial_direction*cart_settings.wheel_rpm(speed.reference)*1000),
+            lroundf(serial_direction*cart_settings.wheel_rpm(speed.feedback)*1000),
+            lroundf(speed.limit*1000),lroundf(cart_settings.wheel_rpm(speed.slew)*1000),
+-           lroundf(feedback.q*1000),lroundf(m.peak_current[0]*1000),
++           lroundf(feedback.q*1000),lroundf(speed.feedforward*1000),lroundf(m.peak_current[0]*1000),
+            lroundf(m.peak_current[1]*1000),lroundf(m.peak_current[2]*1000),static_cast<unsigned long>(config_id));
+     return;
+   }
+@@ -536,7 +536,7 @@
+          "candidate_R_mOhm=%ld candidate_L_uH=%ld emf_mV=%ld pll_mrad=%ld start_mrad=%ld lock_n=%lu "
+          "adc_min_cnt=%u pwm_min_cnt=%u start_iq_min_mA=%ld uart_iq_active=%u "
+          "uart_req_mA=%ld uart_iq_mA=%ld uart_direction=%d cart_protocol=4 "
+-         "speed_mode=%u req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld iq_max_mA=%ld engaged=%u slew_mrpm_s=%ld "
++         "speed_mode=%u req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld iq_max_mA=%ld engaged=%u slew_mrpm_s=%ld ff_mA=%ld "
+          "sample_reason=%s sum_mA=%ld sum_peak_mA=%ld sum_bad_n=%u sum_max_bad_n=%u "
+          "startup_bad_obs=%lu startup_bad_speed=%lu startup_bad_angle=%lu startup_max_lock=%lu observer_reason=%s config_id=%lu\r\n",
+          motor::name(state), motor::name(fault),
+@@ -566,7 +566,7 @@
+          speed_active, lroundf(serial_direction*cart_settings.wheel_rpm(speed.requested)*1000),
+          lroundf(serial_direction*cart_settings.wheel_rpm(speed.reference)*1000),
+          lroundf(serial_direction*cart_settings.wheel_rpm(speed.feedback)*1000),
+-         lroundf(speed.limit*1000), speed.engaged, lroundf(cart_settings.wheel_rpm(speed.slew)*1000),
++         lroundf(speed.limit*1000), speed.engaged, lroundf(cart_settings.wheel_rpm(speed.slew)*1000),lroundf(speed.feedforward*1000),
+          sample_detail, std::isfinite(sum.sum_a) ? lroundf(sum.sum_a*1000) : 0L,
+          lroundf(sum.peak_a*1000), sum.consecutive, sum.peak_consecutive,
+          static_cast<unsigned long>(bad_observer), static_cast<unsigned long>(bad_speed),
+@@ -669,7 +669,7 @@
+     moe=(TIM1->BDTR & TIM_BDTR_MOE)!=0; ccer=TIM1->CCER;
+   }
+   printf("speed_mode=%u state=%s fault=%s req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld raw_mrpm=%ld "
+-         "iq_ref_mA=%ld iq_mA=%ld iq_max_mA=%ld engaged=%u K_milli=%ld "
++         "iq_ref_mA=%ld iq_mA=%ld iq_max_mA=%ld ff_mA=%ld engaged=%u K_milli=%ld "
+          "bus_mV=%ld drive_n=%lu max_cycles=%lu lock_n=%lu lock_max=%lu "
+          "bad_obs=%lu bad_speed=%lu bad_angle=%lu pll_mrad=%ld ramp_mrad=%ld MOE=%lu CCER=0x%lx\r\n",
+          mode,motor::name(state),motor::name(fault),
+@@ -677,7 +677,7 @@
+          lroundf(cart_settings.wheel_rpm(speed.reference)*1000),
+          lroundf(cart_settings.wheel_rpm(speed.feedback)*1000),
+          lroundf(cart_settings.wheel_rpm(measured)*1000),
+-         lroundf(speed.output*1000),lroundf(iq*1000),lroundf(speed.limit*1000),speed.engaged,static_cast<long>(cart_settings.wheel_cycles_milli),
++         lroundf(speed.output*1000),lroundf(iq*1000),lroundf(speed.limit*1000),lroundf(speed.feedforward*1000),speed.engaged,static_cast<long>(cart_settings.wheel_cycles_milli),
+          lroundf(bus*1000),count,cycles,lock_n,max_lock,bad_observer,bad_speed,bad_angle,
+          lroundf(pll*1000),lroundf(load_angle*1000),moe,ccer);
+ }
+@@ -720,7 +720,7 @@
+ }
+ void print_cart_settings()
+ {
+-  printf("config_version=1 config_id=%lu pending=%u",static_cast<unsigned long>(active_config_id),settings_transaction.pending);
++  printf("config_version=2 config_id=%lu pending=%u",static_cast<unsigned long>(active_config_id),settings_transaction.pending);
+   for (unsigned i=0;i<motor::CartSettings::field_count;++i)
+     printf(" %s=%lu",motor::CartSettings::key(i),static_cast<unsigned long>(cart_settings.get(i)));
+   printf("\r\n");
+@@ -767,7 +767,7 @@
+   if (configure_cart(line)) return;
+   if (!strcmp(line, "cartcap")) {
+     printf("cart_protocol=4 signed_iq=1 signed_rpm=1 continuous_speed=1 controlled_reverse=1 controlled_zero=1 reverse_dwell_ms=2000 watchdog_ms=500 "
+-           "config_protocol=1 supported_max_mrpm=100000 brake_from_feedback=1 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
++           "config_protocol=2 supported_max_mrpm=100000 brake_from_feedback=1 acceleration_ff=1 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
+            "max_speed_iq_mA=%lu min_mrpm=%lu max_mrpm=%lu startup_mA=%lu slew_mrpm_s=%lu "
+            "max_slew_mrpm_s=%lu startup_target_mrpm=%lu live_target=1\r\n",
+            lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),
+--- a/Core/Src/motor_control.cpp
++++ b/Core/Src/motor_control.cpp
+@@ -225,7 +225,7 @@
+   SpeedLoop candidate;
+   if (!tuning.valid() || !std::isfinite(startup_hz) || (startup_hz != 0 && (startup_hz < 10 || startup_hz > 100)) ||
+       hfi_mode_ != HfiMode::off || maximum_current > .5f*limits.current ||
+-      !candidate.start(hz,maximum_current,slew_hz_per_s,startup_hz > 0) ||
++      !candidate.start(hz,maximum_current,slew_hz_per_s,startup_hz > 0,tuning.accel_ff_ma*.001f) ||
+       !run(limits,p,startup_hz > 0 ? std::min(hz,startup_hz) : hz,
+            std::min(maximum_current,startup_hz > 0 ? tuning.startup_ma*.001f : .3f))) return false;
+   speed_loop=candidate; speed_mode_=true; continuous_speed_=continuous;

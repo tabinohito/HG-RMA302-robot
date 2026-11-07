@@ -10,7 +10,8 @@ from .control import InputState
 # Linux input-event-codes.h, stable evdev ABI.
 EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
 SYN_REPORT, SYN_DROPPED = 0, 3
-ABS_X, ABS_Y = 0, 1
+ABS_X, ABS_Y, ABS_RY, ABS_HAT0X, ABS_HAT0Y = 0, 1, 4, 16, 17
+CONTROL_AXES = (ABS_Y, ABS_RY, ABS_HAT0X, ABS_HAT0Y)
 BTN_B, BTN_LB, BTN_START = 305, 310, 315
 SUPPORTED_GAMEPADS = {
     (0x046D, 0xC21D): "Logitech F310 (XInput)",
@@ -34,9 +35,10 @@ class EventDecoder:
     def __init__(self, axes: dict[int, tuple[int, int, int]], keys=()):
         self.axes = axes
         self.state = InputState(
-            steering=normalize(*axes[ABS_X]),
-            throttle=-normalize(*axes[ABS_Y]),
-            deadman=BTN_LB in keys, estop=BTN_B in keys, reset=BTN_START in keys,
+            left_stick=-normalize(*axes[ABS_Y]),
+            right_stick=-normalize(*axes[ABS_RY]),
+            dpad_x=axes[ABS_HAT0X][0], dpad_y=-axes[ABS_HAT0Y][0],
+            estop=BTN_B in keys, reset=BTN_START in keys,
         )
         self.changed = False
         self.changed_at = self.state.last_input_at
@@ -44,16 +46,18 @@ class EventDecoder:
     def feed(self, event_type: int, code: int, value: int, timestamp: float):
         if event_type == EV_SYN and code == SYN_DROPPED:
             # Terminate the run instead of risking a lost release/stop edge.
-            raise OSError("Gamepad SYN_DROPPED: input queue overflow; restart with LB released")
+            raise OSError("Gamepad SYN_DROPPED: input queue overflow; restart with both sticks and D-pad neutral")
         field = None
-        if event_type == EV_ABS and code in (ABS_X, ABS_Y):
-            _, low, high = self.axes[code]
-            value = normalize(value, low, high)
-            field = "steering" if code == ABS_X else "throttle"
-            if code == ABS_Y:
+        if event_type == EV_ABS and code in CONTROL_AXES:
+            field = {ABS_Y: "left_stick", ABS_RY: "right_stick",
+                     ABS_HAT0X: "dpad_x", ABS_HAT0Y: "dpad_y"}[code]
+            if code in (ABS_Y, ABS_RY):
+                _, low, high = self.axes[code]
+                value = -normalize(value, low, high)
+            elif code == ABS_HAT0Y:
                 value = -value
         elif event_type == EV_KEY and value in (0, 1):
-            field = {BTN_LB: "deadman", BTN_B: "estop", BTN_START: "reset"}.get(code)
+            field = {BTN_B: "estop", BTN_START: "reset"}.get(code)
             value = bool(value)
         if field is not None:
             self.state = replace(self.state, **{field: value})
@@ -95,8 +99,8 @@ def validate_gamepad(device):
         raise ValueError(f"Unsupported gamepad USB {info.vendor:04x}:{info.product:04x}; "
                          "use F310/F710 in X mode or the supported Xbox 360-compatible controller")
     caps = device.capabilities(absinfo=False)
-    if not {ABS_X, ABS_Y} <= set(caps.get(EV_ABS, [])) or not {
-        BTN_B, BTN_LB, BTN_START
+    if not set(CONTROL_AXES) <= set(caps.get(EV_ABS, [])) or not {
+        BTN_B, BTN_START
     } <= set(caps.get(EV_KEY, [])):
         raise ValueError("Gamepad axis/button mapping is unsupported")
     return caps
@@ -120,7 +124,7 @@ class Gamepad:
             fcntl.ioctl(self.device.fd, EVIOCSCLOCKID, struct.pack("i", time.CLOCK_MONOTONIC))
             self.device.grab()
             axes = {}
-            for code in (ABS_X, ABS_Y):
+            for code in CONTROL_AXES:
                 info = self.device.absinfo(code)
                 axes[code] = (info.value, info.min, info.max)
             self.decoder = EventDecoder(axes, self.device.active_keys())
@@ -149,7 +153,7 @@ class Gamepad:
             self.device.active_keys()
             self.last_device_check_at = time.monotonic()
             if any(not 0 <= self.last_device_check_at - frame.last_input_at < self.event_timeout_s for frame in frames):
-                raise OSError("Gamepad input queue is stale; restart with LB released")
+                raise OSError("Gamepad input queue is stale; restart with both sticks and D-pad neutral")
             frames = [replace(frame, last_device_check_at=self.last_device_check_at) for frame in frames]
         return frames
 

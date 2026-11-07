@@ -12,3 +12,4 @@ wheels/
 # Local hardware configuration and generated firmware/validation artifacts
 config.local.json
 artifacts/
+.pio/

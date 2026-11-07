@@ -7,12 +7,12 @@ from unittest.mock import Mock, patch
 from hg_rma302.gamepad import Gamepad
 
 
-def device(path, vendor, product, *, keys=(305, 310, 315)):
+def device(path, vendor, product, *, keys=(305,315)):
     result = Mock()
     result.path, result.name, result.phys, result.fd = path, "Test controller", "usb-test", 99
     result.info = SimpleNamespace(vendor=vendor, product=product)
-    result.capabilities.return_value = {1: list(keys), 3: [0, 1]}
-    result.absinfo.return_value = SimpleNamespace(value=0, min=-32768, max=32767)
+    result.capabilities.return_value = {1: list(keys), 3: [0, 1, 3, 4, 16, 17]}
+    result.absinfo.side_effect = lambda code: SimpleNamespace(value=0, min=-1 if code in (16,17) else -32768, max=1 if code in (16,17) else 32767)
     result.active_keys.return_value = []
     result.read.return_value = [
         SimpleNamespace(type=1, code=310, value=1, timestamp=lambda: 12.5),
@@ -40,8 +40,8 @@ class GamepadTests(unittest.TestCase):
                         self.assertEqual(pad.device.path, "/dev/input/test")
                         frames = pad.read()
                         self.assertEqual(len(frames), 1)
-                        self.assertTrue(frames[0].deadman)
-                        self.assertEqual(frames[0].throttle, 1)
+                        self.assertAlmostEqual(frames[0].right_stick,0,places=4)
+                        self.assertEqual(frames[0].left_stick, 1)
                         self.assertEqual(frames[0].last_input_at, 12.5)
                     finally:
                         pad.close()
@@ -72,7 +72,7 @@ class GamepadTests(unittest.TestCase):
         self.assertFalse(pad.requires_event_updates)
         self.assertEqual(pad.state.last_input_at, 12.5)
         self.assertEqual(pad.state.last_device_check_at, 20)
-        self.assertTrue(pad.state.deadman)
+        self.assertEqual(pad.state.left_stick,1)
 
     def test_wired_poll_failure_is_not_ignored(self):
         pad, raw = self.open_pad()
@@ -109,13 +109,22 @@ class GamepadTests(unittest.TestCase):
                 pad.grab.assert_not_called()
                 pad.close.assert_called_once()
 
-    def test_missing_deadman_button_rejected_before_grab(self):
-        pad = device("/dev/input/test", 0x046d, 0xc21d, keys=(305, 315))
+    def test_missing_stop_button_rejected_before_grab(self):
+        pad = device("/dev/input/test", 0x046d, 0xc21d, keys=(315,))
         with patch("hg_rma302.gamepad._evdev", return_value=SimpleNamespace(InputDevice=lambda path: pad)):
             with self.assertRaisesRegex(ValueError, "mapping is unsupported"):
                 Gamepad(pad.path)
         pad.grab.assert_not_called()
         pad.close.assert_called_once()
+
+    def test_missing_right_vertical_or_dpad_axis_rejected_before_grab(self):
+        for missing in (4,16,17):
+            raw=device('/dev/input/test',0x045e,0x028e)
+            raw.capabilities.return_value[3].remove(missing)
+            with patch('hg_rma302.gamepad._evdev',return_value=SimpleNamespace(InputDevice=lambda path:raw)):
+                with self.assertRaisesRegex(ValueError,'mapping is unsupported'):Gamepad(raw.path)
+            raw.grab.assert_not_called()
+            raw.close.assert_called_once()
 
     def test_multiple_controllers_require_explicit_selection(self):
         pads = {"/dev/input/a": device("/dev/input/a", 0x046d, 0xc21d),

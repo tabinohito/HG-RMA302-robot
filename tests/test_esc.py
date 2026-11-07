@@ -103,6 +103,20 @@ class WheelTests(unittest.TestCase):
             self.wheel.update(13, now)
         self.assertEqual(self.port.sent.count("rpm 13.000"), 1)
 
+    def test_confirmed_commands_can_update_at_100_hz_without_a_queue(self):
+        self.start()
+        self.wheel.update(9, .05)
+        self.port.lines=['OK wheel_target_mrpm=9000']; self.wheel.receive(.055)
+        self.wheel.update(10,.055)
+        self.assertNotIn('rpm 10.000',self.port.sent)
+        self.wheel.update(11,.061)
+        self.assertIn('rpm 11.000',self.port.sent)
+        self.wheel.update(12,.072)
+        self.assertNotIn('rpm 12.000',self.port.sent)  # ACK still outstanding.
+        self.port.lines=['OK wheel_target_mrpm=11000']; self.wheel.receive(.076)
+        self.wheel.update(13,.076)
+        self.assertIn('rpm 13.000',self.port.sent)
+
     def test_wrong_acceleration_fails(self):
         self.start()
         self.port.lines = [status("align", count=200, slew_mrpm_s="2000")]
@@ -213,6 +227,16 @@ class WheelTests(unittest.TestCase):
         self.assertEqual(left.sent, ["stop"])
         self.assertEqual(right.sent, ["stop"])
 
+    def test_invalid_raw_speed_cannot_be_hidden_by_smoothing(self):
+        for value in (float('nan'), float('inf'), 100.01, 7):
+            pair = EscPair.__new__(EscPair)
+            pair.config = Config(DriveSettings(max_speed_rpm=100))
+            pair.ports, pair.wheels = [Port(), Port()], []
+            pair._initialize_recovery()
+            with self.subTest(value=value), self.assertRaisesRegex(EscError, 'Speed outside supported range'):
+                pair.update(Output(value, 8, True), 0)
+            self.assertTrue(all(port.sent == ['stop'] for port in pair.ports))
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_example_loads(self):
@@ -231,10 +255,10 @@ class ConfigurationTests(unittest.TestCase):
             DriveSettings(max_current_a=2.01)
 
     def test_acceleration_range(self):
-        for value in (0, 20.01, True, float('nan')):
+        for value in (0, 30.01, True, float('nan')):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 DriveSettings(acceleration_rpm_s=value)
-        self.assertEqual(DriveSettings(acceleration_rpm_s=20).acceleration_rpm_s, 20)
+        self.assertEqual(DriveSettings(acceleration_rpm_s=30).acceleration_rpm_s, 30)
 
     def test_motor_parameters_must_be_a_pair(self):
         with self.assertRaises(ValueError):

@@ -1,0 +1,47 @@
+--- a/Core/Inc/motor_speed.hpp
++++ b/Core/Inc/motor_speed.hpp
+@@ -25,6 +25,13 @@
+     if(responsive_ && engaged && hz<requested) {
+       reference=std::min(reference,std::max(hz,std::max(0.f,feedback)));
+       feedforward=0;
++      if (hz<feedback) {
++        // A voltage-limited run can retain +2 A of integral. Discard that
++        // motoring bias when the operator asks to slow below actual speed,
++        // including nonzero targets; otherwise braking starts far too late.
++        integral_=std::min(integral_,0.f);
++        output=std::min(output,0.f);
++      }
+     }
+     requested=hz; return true;
+   }
+@@ -49,7 +56,7 @@
+     const float previous_reference=reference;
+     reference+=std::clamp(requested-reference,-rate*period,rate*period);
+     // Feed forward the bounded reference acceleration, not a raw joystick step.
+-    // Average 50 Hz UART stair steps at 1 kHz; never retain positive FF through
++    // Average up to 100 Hz UART stair steps at 1 kHz; never retain positive FF through
+     // a reduction/brake or use FF to skip sensorless acquisition.
+     if (!allow_braking || braking_ || requested<previous_reference) feedforward=0;
+     else {
+--- a/Core/Inc/cart_settings.hpp
++++ b/Core/Inc/cart_settings.hpp
+@@ -48,7 +48,7 @@
+         wheel_cycles_milli>=1000 && wheel_cycles_milli<=1000000 &&
+         min_mrpm>=8000 && min_mrpm<=max_mrpm && max_mrpm<=100000 &&
+         max_iq_ma>=100 && max_iq_ma<=2000 && max_iq_ma*2<=phase_trip_ma &&
+-        max_slew_mrpm_s>=1000 && max_slew_mrpm_s<=20000 &&
++        max_slew_mrpm_s>=1000 && max_slew_mrpm_s<=30000 &&
+         startup_mrpm>=8000 && startup_mrpm<=min_mrpm &&
+         startup_ma>=100 && startup_ma<=1000 && startup_ma*2<=phase_trip_ma &&
+         accel_ff_ma<=1000 &&
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -767,7 +767,7 @@
+   if (configure_cart(line)) return;
+   if (!strcmp(line, "cartcap")) {
+     printf("cart_protocol=4 signed_iq=1 signed_rpm=1 continuous_speed=1 controlled_reverse=1 controlled_zero=1 reverse_dwell_ms=2000 watchdog_ms=500 "
+-           "config_protocol=2 supported_max_mrpm=100000 brake_from_feedback=1 acceleration_ff=1 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
++           "config_protocol=2 supported_max_mrpm=100000 brake_from_feedback=1 acceleration_ff=1 prompt_reduction=1 supported_slew_mrpm_s=30000 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
+            "max_speed_iq_mA=%lu min_mrpm=%lu max_mrpm=%lu startup_mA=%lu slew_mrpm_s=%lu "
+            "max_slew_mrpm_s=%lu startup_target_mrpm=%lu live_target=1\r\n",
+            lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),

@@ -1,0 +1,516 @@
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -51,6 +51,9 @@
+ };
+ Measurements measurement;
+ motor::CurrentSumGuard current_sum_guard;
++motor::CartSettings cart_settings;
++motor::CartSettingsTransaction settings_transaction;
++uint32_t active_config_id = 0;
+ const char* sample_reason = "none";
+ motor::Controller controller;
+ motor::HfiEstimator hfi_processor; // foreground only; never shares the ISR CORDIC
+@@ -110,6 +113,7 @@
+ void stop_drive()
+ {
+   pending_wheel_rpm=0;
++  settings_transaction.abort();
+   disable_outputs();
+   controller.stop();
+   sample_reason = "none";
+@@ -143,7 +147,7 @@
+   if (outputs_enabled) {
+     if (measurement.bus < limits.bus_min || measurement.bus > limits.bus_max)
+       trip(motor::Fault::bus);
+-    if (measurement.ntc < 50 || measurement.ntc > cfg::ntc_trip_raw)
++    if (measurement.ntc < 50 || measurement.ntc > cart_settings.ntc_trip_raw)
+       trip(motor::Fault::temperature);
+   }
+ }
+@@ -401,7 +405,7 @@
+       HAL_GetTick() - measurement.last_fast_ms > 2 ||
+       HAL_GetTick() - measurement.last_slow_ms > 5 ||
+       measurement.bus < limits.bus_min || measurement.bus > limits.bus_max ||
+-      measurement.ntc < 50 || measurement.ntc > cfg::ntc_trip_raw ||
++      measurement.ntc < 50 || measurement.ntc > cart_settings.ntc_trip_raw ||
+       (TIM1->SR & TIM_SR_BIF) || !(TIM1->BDTR & TIM_BDTR_BKE)) return false;
+   // Nominal 16 ms independent watchdog; cannot be disabled without reset.
+   IWDG->KR = 0xCCCC;
+@@ -458,8 +462,8 @@
+   armed=true; armed_at=HAL_GetTick();
+   if (!cart_direction.begin(direction,HAL_GetTick()) ||
+       !controller.run_speed(limits,controller.parameters,
+-        cfg::electrical_hz_from_wheel_rpm(std::abs(rpm)),current,slew,true,
+-        cfg::electrical_hz_from_wheel_rpm(cfg::wheel_min_rpm)) || !enable_outputs())
++        cart_settings.electrical_hz(std::abs(rpm)),current,slew,true,
++        cart_settings.electrical_hz(cart_settings.startup_mrpm*.001f)) || !enable_outputs())
+     trip(motor::Fault::configuration);
+   last_keepalive_ms=keepalive; // restarting cannot extend a dead host's lease
+ }
+@@ -483,10 +487,10 @@
+   int serial_direction;
+   motor::DQ reference, feedback;
+   bool reverse, ready;
+-  uint32_t bdtr, ccer;
++  uint32_t bdtr, ccer, config_id;
+   {
+     InterruptLock lock;
+-    m = measurement; state = controller.state; fault = controller.fault;
++    m = measurement; state = controller.state; fault = controller.fault; config_id=active_config_id;
+     sum = current_sum_guard; sample_detail = sample_reason;
+     observer_detail = controller.observer_reason;
+     p = controller.parameters; hz = controller.observer.omega / (2 * motor::pi);
+@@ -511,19 +515,19 @@
+   if (compact && speed_active) {
+     printf("state=%s fault=%s cal=%s n=%lu bus_mV=%ld MOE=%u CCER=0x%lx R_mOhm=%ld L_uH=%ld "
+            "cart_protocol=4 speed_mode=1 uart_direction=%d req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld "
+-           "iq_max_mA=%ld slew_mrpm_s=%ld iq_mA=%ld peak_mA=%ld,%ld,%ld\r\n",
++           "iq_max_mA=%ld slew_mrpm_s=%ld iq_mA=%ld peak_mA=%ld,%ld,%ld config_id=%lu\r\n",
+            motor::name(state),motor::name(fault),m.calibrated ? "ok" : "pending",
+            static_cast<unsigned long>(m.samples),lroundf(m.bus*1000),(bdtr&TIM_BDTR_MOE)!=0,
+            static_cast<unsigned long>(ccer),lroundf(p.resistance*1000),lroundf(p.inductance*1e6f),
+-           serial_direction,lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.requested)*1000),
+-           lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.reference)*1000),
+-           lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.feedback)*1000),
+-           lroundf(speed.limit*1000),lroundf(cfg::wheel_rpm_from_electrical_hz(speed.slew)*1000),
++           serial_direction,lroundf(serial_direction*cart_settings.wheel_rpm(speed.requested)*1000),
++           lroundf(serial_direction*cart_settings.wheel_rpm(speed.reference)*1000),
++           lroundf(serial_direction*cart_settings.wheel_rpm(speed.feedback)*1000),
++           lroundf(speed.limit*1000),lroundf(cart_settings.wheel_rpm(speed.slew)*1000),
+            lroundf(feedback.q*1000),lroundf(m.peak_current[0]*1000),
+-           lroundf(m.peak_current[1]*1000),lroundf(m.peak_current[2]*1000));
++           lroundf(m.peak_current[1]*1000),lroundf(m.peak_current[2]*1000),static_cast<unsigned long>(config_id));
+     return;
+   }
+-  printf("state=%s fault=%s cal=%s n=%lu slow=%lu bus_mV=%ld ntc=%u pot=%u "
++  printf("state=%s fault=%s cal=%s n=%lu slow=%lu bus_mV=%ld ntc=%u ntc_trip_raw=%lu pot=%u "
+          "raw=%u,%u,%u zero=%ld,%ld,%ld span=%u,%u,%u i_mA=%ld,%ld,%ld "
+          "MOE=%u CCER=0x%lx max_cycles=%lu R_mOhm=%ld L_uH=%ld "
+          "fit_permille=%ld e_mHz=%ld flux_uWb=%ld tx_drop=%lu rx_err=%lu "
+@@ -534,11 +538,11 @@
+          "uart_req_mA=%ld uart_iq_mA=%ld uart_direction=%d cart_protocol=4 "
+          "speed_mode=%u req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld iq_max_mA=%ld engaged=%u slew_mrpm_s=%ld "
+          "sample_reason=%s sum_mA=%ld sum_peak_mA=%ld sum_bad_n=%u sum_max_bad_n=%u "
+-         "startup_bad_obs=%lu startup_bad_speed=%lu startup_bad_angle=%lu startup_max_lock=%lu observer_reason=%s\r\n",
++         "startup_bad_obs=%lu startup_bad_speed=%lu startup_bad_angle=%lu startup_max_lock=%lu observer_reason=%s config_id=%lu\r\n",
+          motor::name(state), motor::name(fault),
+          m.calibrated ? "ok" : (m.calibration_failed ? "failed" : "pending"),
+          static_cast<unsigned long>(m.samples), static_cast<unsigned long>(m.regular_samples),
+-         lroundf(m.bus * 1000), m.ntc, m.pot, m.raw[0], m.raw[1], m.raw[2],
++         lroundf(m.bus * 1000), m.ntc, static_cast<unsigned long>(cart_settings.ntc_trip_raw), m.pot, m.raw[0], m.raw[1], m.raw[2],
+          lroundf(m.offset[0]), lroundf(m.offset[1]), lroundf(m.offset[2]),
+          m.calibration_count ? m.high[0] - m.low[0] : 0,
+          m.calibration_count ? m.high[1] - m.low[1] : 0,
+@@ -559,14 +563,14 @@
+          lroundf(emf * 1000), lroundf(pll_error * 1000), lroundf(startup_error * 1000), lock_samples,
+          m.adc_entry_min, m.pwm_write_min, lroundf(startup_iq_minimum * 1000),
+          serial_active, lroundf(serial_requested*1000), lroundf(serial_iq*1000), serial_direction,
+-         speed_active, lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.requested)*1000),
+-         lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.reference)*1000),
+-         lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.feedback)*1000),
+-         lroundf(speed.limit*1000), speed.engaged, lroundf(cfg::wheel_rpm_from_electrical_hz(speed.slew)*1000),
++         speed_active, lroundf(serial_direction*cart_settings.wheel_rpm(speed.requested)*1000),
++         lroundf(serial_direction*cart_settings.wheel_rpm(speed.reference)*1000),
++         lroundf(serial_direction*cart_settings.wheel_rpm(speed.feedback)*1000),
++         lroundf(speed.limit*1000), speed.engaged, lroundf(cart_settings.wheel_rpm(speed.slew)*1000),
+          sample_detail, std::isfinite(sum.sum_a) ? lroundf(sum.sum_a*1000) : 0L,
+          lroundf(sum.peak_a*1000), sum.consecutive, sum.peak_consecutive,
+          static_cast<unsigned long>(bad_observer), static_cast<unsigned long>(bad_speed),
+-         static_cast<unsigned long>(bad_angle), static_cast<unsigned long>(max_lock), observer_detail);
++         static_cast<unsigned long>(bad_angle), static_cast<unsigned long>(max_lock), observer_detail, static_cast<unsigned long>(config_id));
+ }
+ void finish_identification()
+ {
+@@ -669,11 +673,11 @@
+          "bus_mV=%ld drive_n=%lu max_cycles=%lu lock_n=%lu lock_max=%lu "
+          "bad_obs=%lu bad_speed=%lu bad_angle=%lu pll_mrad=%ld ramp_mrad=%ld MOE=%lu CCER=0x%lx\r\n",
+          mode,motor::name(state),motor::name(fault),
+-         lroundf(cfg::wheel_rpm_from_electrical_hz(speed.requested)*1000),
+-         lroundf(cfg::wheel_rpm_from_electrical_hz(speed.reference)*1000),
+-         lroundf(cfg::wheel_rpm_from_electrical_hz(speed.feedback)*1000),
+-         lroundf(cfg::wheel_rpm_from_electrical_hz(measured)*1000),
+-         lroundf(speed.output*1000),lroundf(iq*1000),lroundf(speed.limit*1000),speed.engaged,lroundf(cfg::wheel_electrical_cycles*1000),
++         lroundf(cart_settings.wheel_rpm(speed.requested)*1000),
++         lroundf(cart_settings.wheel_rpm(speed.reference)*1000),
++         lroundf(cart_settings.wheel_rpm(speed.feedback)*1000),
++         lroundf(cart_settings.wheel_rpm(measured)*1000),
++         lroundf(speed.output*1000),lroundf(iq*1000),lroundf(speed.limit*1000),speed.engaged,static_cast<long>(cart_settings.wheel_cycles_milli),
+          lroundf(bus*1000),count,cycles,lock_n,max_lock,bad_observer,bad_speed,bad_angle,
+          lroundf(pll*1000),lroundf(load_angle*1000),moe,ccer);
+ }
+@@ -706,19 +710,72 @@
+   while (*text == ' ' || *text == '\t') ++text;
+   return *text == '\0';
+ }
++bool parse_uint(const char* text, uint32_t& value)
++{
++  if (*text<'0' || *text>'9') return false;
++  errno=0; char* end=nullptr;
++  const unsigned long parsed=strtoul(text,&end,10);
++  if (errno || *end || parsed>UINT32_MAX) return false;
++  value=static_cast<uint32_t>(parsed); return true;
++}
++void print_cart_settings()
++{
++  printf("config_version=1 config_id=%lu pending=%u",static_cast<unsigned long>(active_config_id),settings_transaction.pending);
++  for (unsigned i=0;i<motor::CartSettings::field_count;++i)
++    printf(" %s=%lu",motor::CartSettings::key(i),static_cast<unsigned long>(cart_settings.get(i)));
++  printf("\r\n");
++}
++bool configure_cart(char* line)
++{
++  if (!strcmp(line,"cartcfg")) { print_cart_settings(); return true; }
++  if (strncmp(line,"cfg",3)) return false;
++  if (outputs_enabled || controller.state!=motor::State::idle || wheel_mode) {
++    printf("ERR configuration requires idle PWM-off\r\n"); return true;
++  }
++  uint32_t value=0;
++  if (!strncmp(line,"cfgbegin ",9) && parse_uint(line+9,value) && settings_transaction.begin(value)) {
++    { InterruptLock lock; active_config_id=0; armed=protection_ready=false; }
++    printf("config_begin=%lu\r\n",static_cast<unsigned long>(value)); return true;
++  }
++  if (!strncmp(line,"cfgset ",7)) {
++    char* key=line+7; char* space=strchr(key,' ');
++    if (space) {
++      *space='\0';
++      if (parse_uint(space+1,value) && settings_transaction.put(key,value)) {
++        printf("config_set=%s value=%lu\r\n",key,static_cast<unsigned long>(value)); return true;
++      }
++    }
++  } else if (!strncmp(line,"cfgapply ",9) && parse_uint(line+9,value) && settings_transaction.ready(value)) {
++    {
++      InterruptLock lock;
++      cart_settings=settings_transaction.candidate;
++      controller.tuning=cart_settings;
++      limits={cart_settings.bus_min_mv/1000.f,cart_settings.bus_max_mv/1000.f,cart_settings.phase_trip_ma/1000.f,cfg::bench_identify_voltage};
++      current_sum_guard.soft_a=cart_settings.sum_soft_ma*.001f;
++      current_sum_guard.hard_a=cart_settings.sum_hard_ma*.001f;
++      current_sum_guard.sample_limit=cart_settings.sum_trip_samples;
++      current_sum_guard.reset();
++      active_config_id=value; settings_transaction.abort(); armed=protection_ready=false;
++    }
++    printf("config_applied=%lu\r\n",static_cast<unsigned long>(value)); return true;
++  }
++  settings_transaction.failed=true;
++  printf("ERR invalid/incomplete cart configuration\r\n"); return true;
++}
+ void command(char *line)
+ {
++  if (configure_cart(line)) return;
+   if (!strcmp(line, "cartcap")) {
+     printf("cart_protocol=4 signed_iq=1 signed_rpm=1 continuous_speed=1 controlled_reverse=1 controlled_zero=1 reverse_dwell_ms=2000 watchdog_ms=500 "
+-           "bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld max_speed_iq_mA=2000 phase_trip_mA=%ld min_mrpm=8000 max_mrpm=25000 "
+-           "startup_mA=600 slew_mrpm_s=20000 max_slew_mrpm_s=20000 startup_target_mrpm=8000 live_target=1 "
+-           "sum_soft_mA=%ld sum_hard_mA=%ld sum_trip_samples=%u startup_lock_bad_cost=%lu startup_lock_score=%lu\r\n",
++           "config_protocol=1 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
++           "max_speed_iq_mA=%lu min_mrpm=%lu max_mrpm=%lu startup_mA=%lu slew_mrpm_s=%lu "
++           "max_slew_mrpm_s=%lu startup_target_mrpm=%lu live_target=1\r\n",
+            lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),
+            lroundf(cfg::pot_maximum_iq*1000), lroundf(limits.current*1000),
+-           lroundf(motor::CurrentSumGuard::soft_limit_a*1000),
+-           lroundf(motor::CurrentSumGuard::hard_limit_a*1000), motor::CurrentSumGuard::trip_samples,
+-           static_cast<unsigned long>(motor::startup_lock_bad_cost),
+-           static_cast<unsigned long>(motor::startup_lock_required_score));
++           static_cast<unsigned long>(cart_settings.max_iq_ma),
++           static_cast<unsigned long>(cart_settings.min_mrpm),static_cast<unsigned long>(cart_settings.max_mrpm),
++           static_cast<unsigned long>(cart_settings.startup_ma),static_cast<unsigned long>(cart_settings.max_slew_mrpm_s),
++           static_cast<unsigned long>(cart_settings.max_slew_mrpm_s),static_cast<unsigned long>(cart_settings.startup_mrpm));
+     return;
+   }
+   if (!strcmp(line, "status")) { print_status(); return; }
+@@ -727,7 +784,7 @@
+   if (!strcmp(line, "indexstatus")) { print_index_status(); return; }
+   if (!strcmp(line, "speedstatus")) { print_speed_status(); return; }
+   if (!strcmp(line, "help")) {
+-    printf("cartcap | status | timing | mathcheck | zero | stop | limits Vmin Vmax Iphase_max Vid | params R_ohm L_H | "
++    printf("cartcap | cartcfg | cfgbegin ID | cfgset KEY INTEGER | cfgapply ID | status | timing | mathcheck | zero | stop | limits Vmin Vmax Iphase_max Vid | params R_ohm L_H | "
+            "potzero | breaktest | arm | identify | run electrical_Hz startup_A | "
+            "runpot electrical_Hz startup_A | hfi off | hfi monitor V | hfi assist V | "
+            "runiq signed_electrical_Hz startup_A signed_Iq_A | iq signed_Iq_A (0=stop; direction change requires stop+dwell) | "
+@@ -754,19 +811,19 @@
+     if (parse_numbers(line+4,value,1)) {
+       InterruptLock lock;
+       if (controller.speed_mode() && (outputs_enabled || controller.state==motor::State::ready)) {
+-        if (value[0]==0 || (std::abs(value[0])>=cfg::wheel_min_rpm && std::abs(value[0])<=cfg::wheel_max_rpm)) {
++        if (value[0]==0 || (std::abs(value[0])>=(cart_settings.min_mrpm*.001f) && std::abs(value[0])<=(cart_settings.max_mrpm*.001f))) {
+           const auto state=controller.state;
+           if (value[0]==0 || !cart_direction.accepts(value[0]) ||
+               state==motor::State::decelerate || state==motor::State::settle || state==motor::State::ready)
+             accepted=controller.brake_speed();
+-          else accepted=controller.set_speed_reference(cfg::electrical_hz_from_wheel_rpm(std::abs(value[0])));
++          else accepted=controller.set_speed_reference(cart_settings.electrical_hz(std::abs(value[0])));
+           if (accepted) pending_wheel_rpm=value[0];
+         }
+       }
+     }
+     if (accepted) printf("OK wheel_target_mrpm=%ld\r\n",lroundf(value[0]*1000));
+-    else printf("ERR rpm requires active runrpm; magnitude 8..25 RPM; fault=%s\r\n",
+-                motor::name(controller.fault));
++    else printf("ERR rpm requires active runrpm; min_mrpm=%lu max_mrpm=%lu fault=%s\r\n",
++                static_cast<unsigned long>(cart_settings.min_mrpm),static_cast<unsigned long>(cart_settings.max_mrpm),motor::name(controller.fault));
+     return;
+   }
+   if (!strncmp(line, "iq ", 3)) {
+@@ -839,7 +896,7 @@
+   if (!strncmp(line, "limits ", 7) && parse_numbers(line + 7, value, 4)) {
+     const motor::Limits candidate{value[0], value[1], value[2], value[3]};
+     if (candidate.valid()) {
+-      InterruptLock lock; limits = candidate; protection_ready = armed = false;
++      InterruptLock lock; limits = candidate; active_config_id=0; protection_ready = armed = false;
+     } else { printf("ERR limits\r\n"); }
+     return;
+   }
+@@ -850,6 +907,7 @@
+     return;
+   }
+   if (!strcmp(line, "arm")) {
++    if (settings_transaction.pending) { printf("ERR configuration incomplete\r\n"); return; }
+     if (!cfg::enable_power_stage) { printf("ERR power stage disabled in motor_board_config.hpp\r\n"); return; }
+     if (!configure_protection()) { printf("ERR limits/calibration/break test\r\n"); return; }
+     armed = true; armed_at = HAL_GetTick();
+@@ -862,8 +920,9 @@
+   const bool hfitest = !strncmp(line, "hfitest ", 8) && parse_numbers(line+8,value,2);
+   const bool index = !strncmp(line, "index ", 6) && parse_numbers(line+6,value,1);
+   const bool runrpm = !strncmp(line, "runrpm ", 7) &&
+-      (parse_numbers(line+7,value,3) || (parse_numbers(line+7,value,2) && (value[2]=cfg::wheel_slew_rpm_per_s,true)));
++      (parse_numbers(line+7,value,3) || (parse_numbers(line+7,value,2) && (value[2]=(cart_settings.max_slew_mrpm_s*.001f),true)));
+   if (identify || run || runpot || runiq || hfitest || index || runrpm) {
++    if (settings_transaction.pending || (runrpm && !active_config_id)) { printf("ERR apply cart configuration first\r\n"); return; }
+     if (!cfg::enable_power_stage || !armed) { printf("ERR drive disabled or not armed\r\n"); return; }
+     bool accepted;
+     {
+@@ -876,11 +935,11 @@
+         pot_mode = false;
+         if (runrpm) {
+           pending_wheel_rpm=value[0];
+-          accepted=std::abs(value[0])>=cfg::wheel_min_rpm && std::abs(value[0])<=cfg::wheel_max_rpm &&
+-              value[1]>=.1f && value[1]<=cfg::wheel_maximum_iq && value[2]>=1 && value[2]<=cfg::wheel_max_slew_rpm_per_s &&
+-              controller.run_speed(limits,controller.parameters,cfg::electrical_hz_from_wheel_rpm(std::abs(value[0])),
+-                                   value[1],cfg::electrical_hz_from_wheel_rpm(value[2]),true,
+-                                   cfg::electrical_hz_from_wheel_rpm(cfg::wheel_min_rpm));
++          accepted=std::abs(value[0])>=(cart_settings.min_mrpm*.001f) && std::abs(value[0])<=(cart_settings.max_mrpm*.001f) &&
++              value[1]>=.1f && value[1]<=(cart_settings.max_iq_ma*.001f) && value[2]>=1 && value[2]<=(cart_settings.max_slew_mrpm_s*.001f) &&
++              controller.run_speed(limits,controller.parameters,cart_settings.electrical_hz(std::abs(value[0])),
++                                   value[1],cart_settings.electrical_hz(value[2]),true,
++                                   cart_settings.electrical_hz(cart_settings.startup_mrpm*.001f));
+         } else if (runpot) {
+           // Permit setting a small current while stopped, then explicitly
+           // starting. Reject a knob position above the selected startup current
+--- a/Core/Src/motor_control.cpp
++++ b/Core/Src/motor_control.cpp
+@@ -223,11 +223,11 @@
+ bool Controller::run_speed(Limits limits, Parameters p, float hz, float maximum_current, float slew_hz_per_s, bool continuous, float startup_hz)
+ {
+   SpeedLoop candidate;
+-  if (!std::isfinite(startup_hz) || (startup_hz != 0 && (startup_hz < 10 || startup_hz > 100)) ||
++  if (!tuning.valid() || !std::isfinite(startup_hz) || (startup_hz != 0 && (startup_hz < 10 || startup_hz > 100)) ||
+       hfi_mode_ != HfiMode::off || maximum_current > .5f*limits.current ||
+       !candidate.start(hz,maximum_current,slew_hz_per_s,startup_hz > 0) ||
+       !run(limits,p,startup_hz > 0 ? std::min(hz,startup_hz) : hz,
+-           std::min(maximum_current,startup_hz > 0 ? .6f : .3f))) return false;
++           std::min(maximum_current,startup_hz > 0 ? tuning.startup_ma*.001f : .3f))) return false;
+   speed_loop=candidate; speed_mode_=true; continuous_speed_=continuous;
+   responsive_speed_=startup_hz > 0;
+   return true;
+@@ -470,9 +470,9 @@
+     startup_iq_minimum = std::max(0.02f, 1.1f * target_iq_ * std::max(0.0f, -load_angle));
+     const bool torque_ready = !current_mode_ || requested_iq_ >= startup_iq_minimum;
+     good_lock_ = startup_lock_score(good_lock_, observed,
+-        forced_omega_ >= 0.95f*target_omega_ && speed_match && angle_match);
++        forced_omega_ >= 0.95f*target_omega_ && speed_match && angle_match, tuning.lock_bad_cost, tuning.lock_score);
+     startup_max_lock=std::max(startup_max_lock,good_lock_);
+-    if (good_lock_ >= startup_lock_required_score && lock && torque_ready) {
++    if (good_lock_ >= tuning.lock_score && lock && torque_ready) {
+       if (speed_mode_) {
+         // Carry the startup load current into the PI instead of dropping Iq
+         // to zero at a small speed error. Slew from the actual handover speed.
+@@ -498,7 +498,8 @@
+     lost_lock_ = observed && (hfi_weight >= .999f || estimated_omega > 2*pi*5) ? 0 : lost_lock_ + 1;
+     const float speed_ceiling = speed_mode_ ? 2*pi*std::max(speed_loop.reference,speed_loop.requested) : target_omega_;
+     if (lost_lock_ > 400) { trip(Fault::observer, "closed_lost"); return {}; }
+-    if (const char* issue = speed_guard(estimated_omega, 2*pi*speed_loop.feedback, speed_ceiling, speed_mode_)) {
++    if (const char* issue = speed_guard(estimated_omega, 2*pi*speed_loop.feedback, speed_ceiling, speed_mode_,
++        tuning.overspeed_filtered_milli*.001f, tuning.overspeed_raw_milli*.001f)) {
+       trip(Fault::observer, issue); return {};
+     }
+     // A bounded speed trim around the starting torque. No reverse/regeneration
+--- a/Core/Inc/motor_control.hpp
++++ b/Core/Inc/motor_control.hpp
+@@ -4,6 +4,7 @@
+ #include "motor_hfi.hpp"
+ #include "motor_index.hpp"
+ #include "motor_speed.hpp"
++#include "cart_settings.hpp"
+ 
+ // Hardware-independent control, SI units. Angles/speeds are electrical, not mechanical.
+ namespace motor {
+@@ -87,6 +88,7 @@
+   bool brake_speed();
+   bool speed_mode() const { return speed_mode_; }
+   SpeedLoop speed_loop{};
++  CartSettings tuning{};
+   bool index_wheel(Limits limits, Parameters parameters, float current);
+   // Fixed startup current, then direct q-axis current control (no speed trim).
+   bool run_current(Limits limits, Parameters parameters, float electrical_hz,
+--- a/Core/Inc/current_sum_guard.hpp
++++ b/Core/Inc/current_sum_guard.hpp
+@@ -14,22 +14,24 @@
+   enum class Issue { none, sustained, excessive, nonfinite };
+   float sum_a = 0, peak_a = 0;
+   unsigned consecutive = 0, peak_consecutive = 0;
++  float soft_a = soft_limit_a, hard_a = hard_limit_a;
++  unsigned sample_limit = trip_samples;
+ 
+-  void reset() { *this = {}; }
++  void reset() { sum_a=peak_a=0; consecutive=peak_consecutive=0; }
+ 
+   Issue step(float u, float v, float w) {
+     sum_a = u + v + w;
+     if (!std::isfinite(sum_a)) return Issue::nonfinite;
+     const float magnitude = std::abs(sum_a);
+     peak_a = std::max(peak_a, magnitude);
+-    if (magnitude > hard_limit_a) return Issue::excessive;
+-    if (magnitude > soft_limit_a) {
+-      if (consecutive < trip_samples) ++consecutive;
++    if (magnitude > hard_a) return Issue::excessive;
++    if (magnitude > soft_a) {
++      if (consecutive < sample_limit) ++consecutive;
+     } else {
+       consecutive = 0;
+     }
+     peak_consecutive = std::max(peak_consecutive, consecutive);
+-    return consecutive >= trip_samples ? Issue::sustained : Issue::none;
++    return consecutive >= sample_limit ? Issue::sustained : Issue::none;
+   }
+ 
+   static const char* name(Issue issue) {
+--- a/Core/Inc/startup_lock.hpp
++++ b/Core/Inc/startup_lock.hpp
+@@ -8,9 +8,11 @@
+ // remain in Controller; this only qualifies the I/f -> FOC handover.
+ inline constexpr uint32_t startup_lock_bad_cost = 5;
+ inline constexpr uint32_t startup_lock_required_score = 2000;
+-inline uint32_t startup_lock_score(uint32_t previous, bool observed, bool geometry_ok) {
++inline uint32_t startup_lock_score(uint32_t previous, bool observed, bool geometry_ok,
++                                  uint32_t bad_cost=startup_lock_bad_cost,
++                                  uint32_t required=startup_lock_required_score) {
+   if (!geometry_ok) return 0;
+-  if (observed) return previous < startup_lock_required_score ? previous + 1 : startup_lock_required_score;
+-  return previous > startup_lock_bad_cost ? previous - startup_lock_bad_cost : 0;
++  if (observed) return previous < required ? previous + 1 : required;
++  return previous > bad_cost ? previous - bad_cost : 0;
+ }
+ }
+--- a/Core/Inc/sensorless_speed_guard.hpp
++++ b/Core/Inc/sensorless_speed_guard.hpp
+@@ -6,11 +6,12 @@
+ // Speed mode uses its existing 30 ms feedback filter for the 1.5x speed limit.
+ // A gross 3x raw estimate still trips immediately; legacy modes stay at 1.5x raw.
+ inline const char* speed_guard(float raw_omega, float feedback_omega,
+-                               float ceiling, bool speed_mode) {
++                               float ceiling, bool speed_mode,
++                               float filtered_ratio=1.5f, float raw_ratio=3.f) {
+   if (!std::isfinite(raw_omega) || !std::isfinite(ceiling) || ceiling <= 0 ||
+       (speed_mode && !std::isfinite(feedback_omega))) return "speed_invalid";
+-  if (std::abs(raw_omega) > (speed_mode ? 3.f : 1.5f)*ceiling) return "speed_gross";
+-  if (speed_mode && std::abs(feedback_omega) > 1.5f*ceiling) return "overspeed";
++  if (std::abs(raw_omega) > (speed_mode ? raw_ratio : 1.5f)*ceiling) return "speed_gross";
++  if (speed_mode && std::abs(feedback_omega) > filtered_ratio*ceiling) return "overspeed";
+   return nullptr;
+ }
+ }
+--- /dev/null
++++ b/Core/Inc/cart_settings.hpp
+@@ -0,0 +1,92 @@
++#pragma once
++#include <cstdint>
++#include <cstring>
++
++namespace motor {
++// Wire units are integers so a readback can be checked exactly. These bounds
++// define supported tuning, not a calibrated temperature or a new hardware rating.
++#define CART_SETTINGS_FIELDS(X) \
++  X(bus_min_mv, 18000) X(bus_max_mv, 26000) X(phase_trip_ma, 4000) \
++  X(ntc_trip_raw, 2873) X(wheel_cycles_milli, 199000) \
++  X(min_mrpm, 8000) X(max_mrpm, 25000) X(max_iq_ma, 2000) X(max_slew_mrpm_s, 20000) \
++  X(startup_mrpm, 8000) X(startup_ma, 600) \
++  X(sum_soft_ma, 1200) X(sum_hard_ma, 2000) X(sum_trip_samples, 10) \
++  X(lock_bad_cost, 5) X(lock_score, 2000) \
++  X(overspeed_filtered_milli, 1500) X(overspeed_raw_milli, 3000)
++
++struct CartSettings {
++#define FIELD(name, initial) uint32_t name = initial;
++  CART_SETTINGS_FIELDS(FIELD)
++#undef FIELD
++  static constexpr unsigned field_count = 18;
++  static const char* key(unsigned index) {
++    static const char* const keys[] = {
++#define KEY(name, initial) #name,
++      CART_SETTINGS_FIELDS(KEY)
++#undef KEY
++    };
++    return index < field_count ? keys[index] : nullptr;
++  }
++  uint32_t get(unsigned index) const {
++    unsigned i=0;
++#define GET(name, initial) if (index==i++) return name;
++    CART_SETTINGS_FIELDS(GET)
++#undef GET
++    return 0;
++  }
++  bool set(const char* key, uint32_t value, unsigned& index) {
++    index=0;
++#define SET(name, initial) if (!std::strcmp(key,#name)) { name=value; return true; } ++index;
++    CART_SETTINGS_FIELDS(SET)
++#undef SET
++    return false;
++  }
++  bool valid() const {
++    return bus_min_mv>=7000 && bus_min_mv<bus_max_mv && bus_max_mv<=26000 &&
++        phase_trip_ma>=1000 && phase_trip_ma<=4000 &&
++        ntc_trip_raw>=1000 && ntc_trip_raw<=3200 &&
++        wheel_cycles_milli>=1000 && wheel_cycles_milli<=1000000 &&
++        min_mrpm>=8000 && min_mrpm<=max_mrpm && max_mrpm<=25000 &&
++        max_iq_ma>=100 && max_iq_ma<=2000 && max_iq_ma*2<=phase_trip_ma &&
++        max_slew_mrpm_s>=1000 && max_slew_mrpm_s<=20000 &&
++        startup_mrpm>=8000 && startup_mrpm<=min_mrpm &&
++        startup_ma>=100 && startup_ma<=1000 && startup_ma*2<=phase_trip_ma &&
++        uint64_t(startup_mrpm)*wheel_cycles_milli>=600000000ULL &&
++        uint64_t(max_mrpm)*wheel_cycles_milli<=6000000000ULL &&
++        uint64_t(max_slew_mrpm_s)*wheel_cycles_milli<=6000000000ULL &&
++        sum_soft_ma>=300 && sum_soft_ma<=1500 && sum_hard_ma>sum_soft_ma && sum_hard_ma<=2000 &&
++        sum_trip_samples>=1 && sum_trip_samples<=40 &&
++        lock_bad_cost>=1 && lock_bad_cost<=100 && lock_score>=500 && lock_score<=10000 &&
++        overspeed_filtered_milli>=1100 && overspeed_filtered_milli<=2000 &&
++        overspeed_raw_milli>=overspeed_filtered_milli && overspeed_raw_milli<=3000;
++  }
++  float electrical_hz(float rpm) const { return rpm*(wheel_cycles_milli*.001f)/60; }
++  float wheel_rpm(float hz) const { return hz*60/(wheel_cycles_milli*.001f); }
++};
++#undef CART_SETTINGS_FIELDS
++
++// No active setting changes until every field has arrived and validates.
++// A malformed/duplicate/unknown field poisons this transaction until begin().
++class CartSettingsTransaction {
++ public:
++  CartSettings candidate{};
++  bool pending=false, failed=false;
++  uint32_t id=0, received=0;
++  void abort() { pending=false; failed=false; id=received=0; }
++  bool begin(uint32_t token) {
++    abort(); candidate={};
++    if (!token) return false;
++    pending=true; id=token; return true;
++  }
++  bool put(const char* key, uint32_t value) {
++    unsigned index=0;
++    if (!pending || failed || !candidate.set(key,value,index) || (received & (1U<<index))) {
++      failed=true; return false;
++    }
++    received|=1U<<index; return true;
++  }
++  bool ready(uint32_t token) const {
++    return pending && !failed && token==id && received==((1U<<CartSettings::field_count)-1) && candidate.valid();
++  }
++};
++}

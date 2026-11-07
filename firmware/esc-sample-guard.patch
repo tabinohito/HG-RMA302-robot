@@ -1,0 +1,344 @@
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -10,6 +10,8 @@
+ #include "pot_current_reference.hpp"
+ #include "serial_current_reference.hpp"
+ #include "cart_direction.hpp"
++#include "current_sum_guard.hpp"
++#include "startup_lock.hpp"
+ #include "wheel_calibration.hpp"
+ #include "stm32g4xx_ll_adc.h"
+ #include "stm32_library/peripherals/Inc/dma_analog_in.hpp"
+@@ -48,6 +50,8 @@
+   bool calibrated = false, calibration_failed = false;
+ };
+ Measurements measurement;
++motor::CurrentSumGuard current_sum_guard;
++const char* sample_reason = "none";
+ motor::Controller controller;
+ motor::HfiEstimator hfi_processor; // foreground only; never shares the ISR CORDIC
+ motor::Limits limits{cfg::bench_bus_min, cfg::bench_bus_max,
+@@ -90,11 +94,14 @@
+   outputs_enabled = false;
+   cart_direction.stop(HAL_GetTick());
+ }
+-void trip(motor::Fault reason)
++void trip(motor::Fault reason, const char* detail = nullptr)
+ {
+   pending_wheel_rpm=0;
+   disable_outputs();
+-  if (controller.state != motor::State::fault) controller.trip(reason);
++  if (controller.state != motor::State::fault) {
++    if (reason == motor::Fault::sample) sample_reason = detail ? detail : "unspecified";
++    controller.trip(reason);
++  }
+   wheel_calibration.cancel();
+   pot_mode = false;
+   serial_reference.reset();
+@@ -105,6 +112,8 @@
+   pending_wheel_rpm=0;
+   disable_outputs();
+   controller.stop();
++  sample_reason = "none";
++  current_sum_guard.reset();
+   wheel_calibration.cancel();
+   serial_reference.reset();
+   armed = pot_mode = false;
+@@ -127,7 +136,7 @@
+   measurement.bus = bus_sensor->read_raw() * cfg::bus_volts_per_count;
+   measurement.ntc = ntc_sensor->read_raw();
+   measurement.pot = pot_sensor->read_raw();
+-  if (!pot_reference.step(measurement.pot, cfg::pot_maximum_iq)) trip(motor::Fault::sample);
++  if (!pot_reference.step(measurement.pot, cfg::pot_maximum_iq)) trip(motor::Fault::sample, "pot_input");
+   serial_reference.step();
+   ++measurement.regular_samples;
+   measurement.last_slow_ms = HAL_GetTick();
+@@ -416,6 +425,8 @@
+   previous_duty = queued_duty = {0, 0, 0};
+   bootstrap_samples = 40;
+   measurement.drive_samples = 0;
++  current_sum_guard.reset();
++  sample_reason = "none";
+   measurement.maximum_cycles = 0;
+   measurement.adc_entry_min = measurement.pwm_write_min = 65535;
+   for (float &peak : measurement.peak_current) peak = 0;
+@@ -456,12 +467,15 @@
+ void print_status(bool compact=false)
+ {
+   Measurements m;
++  motor::CurrentSumGuard sum;
++  const char* sample_detail;
++  const char* observer_detail;
+   motor::State state;
+   motor::Fault fault;
+   motor::Parameters p;
+   motor::Parameters candidate;
+   float hz, fit, flux, emf, pll_error, startup_error, startup_iq_minimum;
+-  uint32_t lock_samples;
++  uint32_t lock_samples, bad_observer, bad_speed, bad_angle, max_lock;
+   float pot_requested, pot_iq;
+   float serial_requested, serial_iq;
+   bool serial_active, speed_active;
+@@ -473,12 +487,16 @@
+   {
+     InterruptLock lock;
+     m = measurement; state = controller.state; fault = controller.fault;
++    sum = current_sum_guard; sample_detail = sample_reason;
++    observer_detail = controller.observer_reason;
+     p = controller.parameters; hz = controller.observer.omega / (2 * motor::pi);
+     candidate = controller.candidate_parameters;
+     fit = controller.fit_error; flux = controller.flux_linkage;
+     emf = controller.observer.emf; pll_error = controller.observer.error;
+     startup_error = controller.startup_angle_error(); lock_samples = controller.lock_samples();
+     startup_iq_minimum = controller.startup_iq_minimum;
++    bad_observer = controller.startup_bad_observer; bad_speed = controller.startup_bad_speed;
++    bad_angle = controller.startup_bad_angle; max_lock = controller.startup_max_lock;
+     pot_requested = pot_reference.requested; pot_iq = pot_reference.current;
+     serial_requested = serial_reference.requested; serial_iq = serial_reference.current;
+     serial_active = serial_reference.active();
+@@ -514,7 +532,9 @@
+          "candidate_R_mOhm=%ld candidate_L_uH=%ld emf_mV=%ld pll_mrad=%ld start_mrad=%ld lock_n=%lu "
+          "adc_min_cnt=%u pwm_min_cnt=%u start_iq_min_mA=%ld uart_iq_active=%u "
+          "uart_req_mA=%ld uart_iq_mA=%ld uart_direction=%d cart_protocol=4 "
+-         "speed_mode=%u req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld iq_max_mA=%ld engaged=%u slew_mrpm_s=%ld\r\n",
++         "speed_mode=%u req_mrpm=%ld ref_mrpm=%ld est_mrpm=%ld iq_max_mA=%ld engaged=%u slew_mrpm_s=%ld "
++         "sample_reason=%s sum_mA=%ld sum_peak_mA=%ld sum_bad_n=%u sum_max_bad_n=%u "
++         "startup_bad_obs=%lu startup_bad_speed=%lu startup_bad_angle=%lu startup_max_lock=%lu observer_reason=%s\r\n",
+          motor::name(state), motor::name(fault),
+          m.calibrated ? "ok" : (m.calibration_failed ? "failed" : "pending"),
+          static_cast<unsigned long>(m.samples), static_cast<unsigned long>(m.regular_samples),
+@@ -542,7 +562,11 @@
+          speed_active, lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.requested)*1000),
+          lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.reference)*1000),
+          lroundf(serial_direction*cfg::wheel_rpm_from_electrical_hz(speed.feedback)*1000),
+-         lroundf(speed.limit*1000), speed.engaged, lroundf(cfg::wheel_rpm_from_electrical_hz(speed.slew)*1000));
++         lroundf(speed.limit*1000), speed.engaged, lroundf(cfg::wheel_rpm_from_electrical_hz(speed.slew)*1000),
++         sample_detail, std::isfinite(sum.sum_a) ? lroundf(sum.sum_a*1000) : 0L,
++         lroundf(sum.peak_a*1000), sum.consecutive, sum.peak_consecutive,
++         static_cast<unsigned long>(bad_observer), static_cast<unsigned long>(bad_speed),
++         static_cast<unsigned long>(bad_angle), static_cast<unsigned long>(max_lock), observer_detail);
+ }
+ void finish_identification()
+ {
+@@ -687,9 +711,14 @@
+   if (!strcmp(line, "cartcap")) {
+     printf("cart_protocol=4 signed_iq=1 signed_rpm=1 continuous_speed=1 controlled_reverse=1 controlled_zero=1 reverse_dwell_ms=2000 watchdog_ms=500 "
+            "bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld max_speed_iq_mA=2000 phase_trip_mA=%ld min_mrpm=8000 max_mrpm=25000 "
+-           "startup_mA=600 slew_mrpm_s=20000 max_slew_mrpm_s=20000 startup_target_mrpm=8000 live_target=1\r\n",
++           "startup_mA=600 slew_mrpm_s=20000 max_slew_mrpm_s=20000 startup_target_mrpm=8000 live_target=1 "
++           "sum_soft_mA=%ld sum_hard_mA=%ld sum_trip_samples=%u startup_lock_bad_cost=%lu startup_lock_score=%lu\r\n",
+            lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),
+-           lroundf(cfg::pot_maximum_iq*1000), lroundf(limits.current*1000));
++           lroundf(cfg::pot_maximum_iq*1000), lroundf(limits.current*1000),
++           lroundf(motor::CurrentSumGuard::soft_limit_a*1000),
++           lroundf(motor::CurrentSumGuard::hard_limit_a*1000), motor::CurrentSumGuard::trip_samples,
++           static_cast<unsigned long>(motor::startup_lock_bad_cost),
++           static_cast<unsigned long>(motor::startup_lock_required_score));
+     return;
+   }
+   if (!strcmp(line, "status")) { print_status(); return; }
+@@ -914,7 +943,7 @@
+     if (TIM1->CR1 & TIM_CR1_DIR) ++timing_capture.down;
+     else ++timing_capture.up;
+   }
+-  if (!(ADC1->ISR & ADC_ISR_JEOS)) { trip(motor::Fault::sample); return; }
++  if (!(ADC1->ISR & ADC_ISR_JEOS)) { trip(motor::Fault::sample, "adc_sequence"); return; }
+   const uint16_t raw[3]{static_cast<uint16_t>(ADC1->JDR1),
+                         static_cast<uint16_t>(ADC2->JDR1),
+                         static_cast<uint16_t>(ADC2->JDR2)};
+@@ -948,8 +977,11 @@
+     for (unsigned i = 0; i < 3; ++i)
+       if (raw[i] < 32 || raw[i] > 4063 || std::abs(measurement.current[i]) > limits.current)
+         trip(motor::Fault::current);
+-    if (std::abs(measurement.current[0] + measurement.current[1] + measurement.current[2]) >
+-        std::max(0.3f, 0.3f * std::min(limits.current,2.0f))) trip(motor::Fault::sample);
++    if (outputs_enabled) {
++      const auto issue = current_sum_guard.step(measurement.current[0], measurement.current[1], measurement.current[2]);
++      if (issue != motor::CurrentSumGuard::Issue::none)
++        trip(motor::Fault::sample, motor::CurrentSumGuard::name(issue));
++    }
+     if (outputs_enabled && !(TIM1->BDTR & TIM_BDTR_MOE)) trip(motor::Fault::break_input);
+     if (outputs_enabled && bootstrap_samples) {
+       if (--bootstrap_samples == 0) {
+@@ -982,6 +1014,7 @@
+       const uint16_t write_count = TIM1->CNT;
+       measurement.pwm_write_min = std::min(measurement.pwm_write_min, write_count);
+       if (!controller.energized()) {
++        if (controller.fault == motor::Fault::sample) sample_reason = "controller_input";
+         disable_outputs(); serial_reference.reset(); pot_mode = false;
+       }
+       else if (DWT->CYCCNT - started > SystemCoreClock / 40000 ||
+--- a/Core/Src/motor_control.cpp
++++ b/Core/Src/motor_control.cpp
+@@ -1,5 +1,7 @@
+ #include "motor_control.hpp"
+ #include "motor_math.hpp"
++#include "startup_lock.hpp"
++#include "sensorless_speed_guard.hpp"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -166,7 +168,7 @@
+ {
+   index_profile.abort();
+   speed_mode_=false; continuous_speed_=false; responsive_speed_=false; speed_loop={}; speed_divider_=0;
+-  state = State::idle; fault = Fault::none;
++  state = State::idle; fault = Fault::none; observer_reason = "none";
+   current_loop_.reset(); observer.reset();
+   current_reference = current_feedback = {};
+   current_mode_ = false; requested_iq_ = maximum_iq_ = 0;
+@@ -174,9 +176,10 @@
+   ticks_ = good_lock_ = lost_lock_ = 0;
+   reset_hfi();
+ }
+-void Controller::trip(Fault reason) {
++void Controller::trip(Fault reason, const char* detail) {
+   index_profile.abort(); index_sync_checked = false;
+   state = State::fault; fault = reason; current_reference = {};
++  observer_reason = reason == Fault::observer ? (detail ? detail : "unspecified") : "none";
+   hfi_estimate.valid = hfi_estimate.referenced = false; hfi_weight = 0;
+ }
+ bool Controller::identify(Limits limits)
+@@ -466,9 +469,10 @@
+     // Wait in the bounded I/f ramp until the operator requests enough current.
+     startup_iq_minimum = std::max(0.02f, 1.1f * target_iq_ * std::max(0.0f, -load_angle));
+     const bool torque_ready = !current_mode_ || requested_iq_ >= startup_iq_minimum;
+-    good_lock_ = lock ? good_lock_ + 1 : 0;
++    good_lock_ = startup_lock_score(good_lock_, observed,
++        forced_omega_ >= 0.95f*target_omega_ && speed_match && angle_match);
+     startup_max_lock=std::max(startup_max_lock,good_lock_);
+-    if (good_lock_ >= 2000 && torque_ready) {
++    if (good_lock_ >= startup_lock_required_score && lock && torque_ready) {
+       if (speed_mode_) {
+         // Carry the startup load current into the PI instead of dropping Iq
+         // to zero at a small speed error. Slew from the actual handover speed.
+@@ -477,7 +481,7 @@
+       }
+       state = State::blend; ticks_ = 0;
+     }
+-    else if (ticks_ >= 120000) { trip(torque_ready ? Fault::observer : Fault::timeout); return {}; }
++    else if (ticks_ >= 120000) { trip(torque_ready ? Fault::observer : Fault::timeout, "startup_lock"); return {}; }
+   } else if (state == State::blend) {
+     forced_angle_ = wrap(forced_angle_ + forced_omega_ * dt);
+     const float fraction = std::min(1.0f, ticks_ * dt / .5f);
+@@ -487,14 +491,15 @@
+                    (0.2f * target_omega_), 0.0f, target_iq_));
+     target = {target_iq_ * (1 - fraction), iq * fraction};
+     lost_lock_ = observed ? 0 : lost_lock_ + 1;
+-    if (lost_lock_ > 400) { trip(Fault::observer); return {}; }
++    if (lost_lock_ > 400) { trip(Fault::observer, "blend_lost"); return {}; }
+     if (fraction >= 1) { state = State::closed; ticks_ = 0; }
+   } else {
+     angle = estimated_angle;
+     lost_lock_ = observed && (hfi_weight >= .999f || estimated_omega > 2*pi*5) ? 0 : lost_lock_ + 1;
+     const float speed_ceiling = speed_mode_ ? 2*pi*std::max(speed_loop.reference,speed_loop.requested) : target_omega_;
+-    if (lost_lock_ > 400 || std::abs(estimated_omega) > 1.5f * speed_ceiling) {
+-      trip(Fault::observer); return {};
++    if (lost_lock_ > 400) { trip(Fault::observer, "closed_lost"); return {}; }
++    if (const char* issue = speed_guard(estimated_omega, 2*pi*speed_loop.feedback, speed_ceiling, speed_mode_)) {
++      trip(Fault::observer, issue); return {};
+     }
+     // A bounded speed trim around the starting torque. No reverse/regeneration
+     // request is made by this initial, positive-direction bench controller.
+--- a/Core/Inc/motor_control.hpp
++++ b/Core/Inc/motor_control.hpp
+@@ -102,11 +102,12 @@
+   float hfi_voltage() const { return hfi_amplitude_; }
+   uint32_t hfi_dropped() const { return hfi_sampler_.dropped(); }
+   void stop();
+-  void trip(Fault reason);
++  void trip(Fault reason, const char* detail = nullptr);
+   // The hardware adapter supplies the previous interval's actual voltage.
+   Duty step(AB current, float bus, AB previous_voltage);
+   State state = State::idle;
+   Fault fault = Fault::none;
++  const char* observer_reason = "none";
+   Parameters parameters{};
+   Parameters candidate_parameters{};
+   Observer observer{};
+--- /dev/null
++++ b/Core/Inc/current_sum_guard.hpp
+@@ -0,0 +1,45 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++
++namespace motor {
++
++// Monitor three-shunt consistency separately from the instantaneous per-phase
++// overcurrent and ADC-validity checks. At 20 kHz, ten samples span 0.5 ms.
++struct CurrentSumGuard {
++  static constexpr float soft_limit_a = 1.2f;
++  static constexpr float hard_limit_a = 2.0f;
++  static constexpr unsigned trip_samples = 10;
++  enum class Issue { none, sustained, excessive, nonfinite };
++  float sum_a = 0, peak_a = 0;
++  unsigned consecutive = 0, peak_consecutive = 0;
++
++  void reset() { *this = {}; }
++
++  Issue step(float u, float v, float w) {
++    sum_a = u + v + w;
++    if (!std::isfinite(sum_a)) return Issue::nonfinite;
++    const float magnitude = std::abs(sum_a);
++    peak_a = std::max(peak_a, magnitude);
++    if (magnitude > hard_limit_a) return Issue::excessive;
++    if (magnitude > soft_limit_a) {
++      if (consecutive < trip_samples) ++consecutive;
++    } else {
++      consecutive = 0;
++    }
++    peak_consecutive = std::max(peak_consecutive, consecutive);
++    return consecutive >= trip_samples ? Issue::sustained : Issue::none;
++  }
++
++  static const char* name(Issue issue) {
++    switch (issue) {
++      case Issue::sustained: return "current_sum_sustained";
++      case Issue::excessive: return "current_sum_hard";
++      case Issue::nonfinite: return "current_sum_nonfinite";
++      default: return "none";
++    }
++  }
++};
++
++} // namespace motor
+--- /dev/null
++++ b/Core/Inc/startup_lock.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++#include <cstdint>
++
++namespace motor {
++// Keep 100 ms of net positive evidence at 20 kHz. One invalid observer sample
++// costs 5 valid samples, requiring >83.3% valid observations to make progress.
++// Speed/angle mismatch always resets all evidence. Runtime loss-of-lock limits
++// remain in Controller; this only qualifies the I/f -> FOC handover.
++inline constexpr uint32_t startup_lock_bad_cost = 5;
++inline constexpr uint32_t startup_lock_required_score = 2000;
++inline uint32_t startup_lock_score(uint32_t previous, bool observed, bool geometry_ok) {
++  if (!geometry_ok) return 0;
++  if (observed) return previous < startup_lock_required_score ? previous + 1 : startup_lock_required_score;
++  return previous > startup_lock_bad_cost ? previous - startup_lock_bad_cost : 0;
++}
++}
+--- /dev/null
++++ b/Core/Inc/sensorless_speed_guard.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++#include <cmath>
++
++namespace motor {
++// The PLL's proportional term produces instantaneous speed spikes at low BEMF.
++// Speed mode uses its existing 30 ms feedback filter for the 1.5x speed limit.
++// A gross 3x raw estimate still trips immediately; legacy modes stay at 1.5x raw.
++inline const char* speed_guard(float raw_omega, float feedback_omega,
++                               float ceiling, bool speed_mode) {
++  if (!std::isfinite(raw_omega) || !std::isfinite(ceiling) || ceiling <= 0 ||
++      (speed_mode && !std::isfinite(feedback_omega))) return "speed_invalid";
++  if (std::abs(raw_omega) > (speed_mode ? 3.f : 1.5f)*ceiling) return "speed_gross";
++  if (speed_mode && std::abs(feedback_omega) > 1.5f*ceiling) return "overspeed";
++  return nullptr;
++}
++}

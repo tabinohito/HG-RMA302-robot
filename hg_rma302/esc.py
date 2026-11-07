@@ -5,10 +5,13 @@ stale speed command alive through a separate heartbeat thread.
 """
 
 import math
+import secrets
 import time
+from dataclasses import dataclass
 
 from .config import Config, MotorSettings
 from .control import Output
+from .wheel_sync import WheelSync
 from .serial_devices import open_ports
 
 
@@ -24,9 +27,13 @@ class EscFault(EscError):
         self.status = dict(status)
         self.previous_status = dict(previous_status or {})
         self.phase = phase
+        reason_key = {'invalid_sample': 'sample_reason', 'observer_lock': 'observer_reason'}.get(status['fault'])
+        detail = f", {reason_key}={status[reason_key]}" if reason_key in status else ""
+        if status['fault'] == 'ntc':
+            detail += f", ntc_raw={status.get('ntc', '?')}, limit={status.get('ntc_trip_raw', '?')}"
         super().__init__(f"{path}: ESC fault: {status['fault']} "
                          f"(previous={self.previous_status.get('state', '?')}, "
-                         f"req_mrpm={status.get('req_mrpm', '?')}, est_mrpm={status.get('est_mrpm', '?')})")
+                         f"req_mrpm={status.get('req_mrpm', '?')}, est_mrpm={status.get('est_mrpm', '?')}{detail})")
 
     @property
     def recoverable(self):
@@ -59,6 +66,8 @@ class SerialPort:
         self.serial = serial.Serial(path, baudrate=baudrate, timeout=0, write_timeout=.02,
                                     exclusive=True, xonxoff=False, rtscts=False, dsrdtr=False)
         self.buffer = bytearray()
+        self.received_bytes = 0
+        self.service = None  # Optional main-thread input/power service during preflight only.
 
     def send(self, command: str):
         payload = (command + "\r\n").encode("ascii")
@@ -72,7 +81,9 @@ class SerialPort:
         if count > 8192:
             raise EscError(f"{self.path}: UART receive backlog")
         if count:
-            self.buffer.extend(self.serial.read(count))
+            data = self.serial.read(count)
+            self.received_bytes += len(data)
+            self.buffer.extend(data)
         lines = []
         while b"\n" in self.buffer:
             raw, _, rest = self.buffer.partition(b"\n")
@@ -100,6 +111,8 @@ class SerialPort:
         self.buffer.clear()
         started = last_data = time.monotonic()
         while time.monotonic() - started < 2:
+            if self.service:
+                self.service()
             count = self.serial.in_waiting
             if count:
                 self.serial.read(min(count, 8192))
@@ -117,10 +130,13 @@ class SerialPort:
 def exchange(port, command: str, predicate, timeout=.6) -> list[str]:
     """Used only while stopped, before entering the real-time control loop."""
     port.read_lines()  # Discard earlier unsolicited status / old acknowledgments.
+    received_before = getattr(port, 'received_bytes', None)
     port.send(command)
     deadline = time.monotonic() + timeout
     received = []
     while time.monotonic() < deadline:
+        if getattr(port, 'service', None):
+            port.service()
         lines = port.read_lines()
         for line in lines:
             if line.startswith("ERR"):
@@ -129,7 +145,19 @@ def exchange(port, command: str, predicate, timeout=.6) -> list[str]:
         if predicate(received):
             return received
         time.sleep(.005)
-    raise EscError(f"{port.path}: no valid response to {command!r}")
+    byte_count = (port.received_bytes - received_before
+                  if received_before is not None else 'unknown')
+    partial = bytes(getattr(port, 'buffer', b''))
+    # Preserve the difference between silence, a truncated line and a reply
+    # from an incompatible device. These details also reach --log on failure
+    # before EscPair has finished construction.
+    detail = (f"received_bytes={byte_count}, complete_lines={len(received)}, "
+              f"partial_bytes={len(partial)}, timeout_s={timeout:g}")
+    if received:
+        detail += f", last_line={received[-1][:160]!r}"
+    if partial:
+        detail += f", partial={partial[:160]!r}"
+    raise EscError(f"{port.path}: no valid response to {command!r} ({detail})")
 
 
 def query_status(port) -> dict[str, str]:
@@ -137,17 +165,57 @@ def query_status(port) -> dict[str, str]:
     return next(parse_status(line) for line in reversed(lines) if line.startswith("state="))
 
 
-def prepare(port, motor: MotorSettings) -> dict[str, str]:
+@dataclass(frozen=True)
+class PreparedEsc:
+    status: dict[str, str]
+    bus_limits_mv: tuple[int, int]
+    config_id: int | None = None
+    settings: dict[str, int] | None = None
+
+
+def check_bus_voltage(path, status, limits_mv, *, context="startup"):
+    low, high = limits_mv
+    measured = int(status["bus_mV"])
+    if not low <= measured <= high:
+        cause = "undervoltage" if measured < low else "overvoltage"
+        raise EscError(f"{path}: {context} bus outside firmware limits {low}..{high} mV; "
+                       f"measured={measured} mV ({measured / 1000:.3f} V, {cause})")
+
+
+def apply_settings(port, settings: dict[str, int]) -> int:
+    """Stage all fields with PWM off, commit atomically, then verify readback."""
+    token = secrets.randbelow(0xffffffff) + 1
+    exchange(port, f'cfgbegin {token}', lambda lines: f'config_begin={token}' in lines)
+    for key, value in settings.items():
+        exchange(port, f'cfgset {key} {value}',
+                 lambda lines, key=key, value=value: f'config_set={key} value={value}' in lines)
+    exchange(port, f'cfgapply {token}', lambda lines: f'config_applied={token}' in lines)
+    lines = exchange(port, 'cartcfg', lambda lines: any(s.startswith('config_version=') for s in lines))
+    result = dict(item.split('=',1) for item in next(s for s in reversed(lines) if s.startswith('config_version=')).split())
+    expected = {'config_version':2, 'config_id':token, 'pending':0, **settings}
+    if result != {key:str(value) for key,value in expected.items()}:
+        mismatch = {k: {'expected':str(v), 'actual':result.get(k)} for k,v in expected.items() if result.get(k)!=str(v)}
+        raise EscError(f'{port.path}: ESC configuration readback mismatch: {mismatch or result}')
+    return token
+
+
+def prepare(port, motor: MotorSettings, settings: dict[str, int], *, allow_standby=False) -> PreparedEsc:
     # VCP history and line-coding recovery must finish before the first query.
     port.synchronize()
     lines = exchange(port, "cartcap", lambda lines: any(line.startswith("cart_protocol=") for line in lines))
     cap = dict(item.split("=", 1) for item in next(line for line in lines if line.startswith("cart_protocol=")).split())
     if any(cap.get(key) != value for key, value in
            {"cart_protocol": "4", "signed_rpm": "1", "continuous_speed": "1", "controlled_reverse": "1", "controlled_zero": "1",
-            "reverse_dwell_ms": "2000", "watchdog_ms": "500", "min_mrpm": "8000",
-            "max_mrpm": "25000", "startup_mA": "600", "slew_mrpm_s": "20000",
-            "max_slew_mrpm_s": "20000", "startup_target_mrpm": "8000", "live_target": "1"}.items()):
+            "reverse_dwell_ms": "2000", "watchdog_ms": "500", "live_target": "1"}.items()):
         raise EscError(f"{port.path}: incompatible firmware; install the protocol 4 controlled-reversal firmware")
+    if cap.get('config_protocol') != '2':
+        raise EscError(f'{port.path}: runtime configuration unsupported; install the acceleration-FF JSON settings firmware (config_protocol=2)')
+    supported_max = int(cap.get('supported_max_mrpm', '25000'))
+    if settings['max_mrpm'] > supported_max:
+        raise EscError(f"{port.path}: firmware supports up to {supported_max/1000:g} RPM; "
+                       "install the 100 RPM tank-control firmware")
+    config_id = apply_settings(port, settings)
+    bus_limits = settings['bus_min_mv'], settings['bus_max_mv']
     # Recalibrate with PWM off to account for current-sense offset drift after warm-up.
     exchange(port, "zero", lambda lines: "calibration=started" in lines)
     deadline = time.monotonic() + 1
@@ -159,10 +227,13 @@ def prepare(port, motor: MotorSettings) -> dict[str, str]:
     check_stopped(status)
     if "speed_mode" not in status or status.get("cart_protocol") != "4":
         raise EscError(f"{port.path}: old firmware; signed speed mode is missing")
-    if not int(cap["bus_min_mV"]) <= int(status["bus_mV"]) <= int(cap["bus_max_mV"]):
-        raise EscError(f"{port.path}: bus outside firmware limits {cap['bus_min_mV']}..{cap['bus_max_mV']} mV")
-    if int(cap.get("max_speed_iq_mA", "0")) != 2000 or int(cap.get("phase_trip_mA", "0")) != 4000:
-        raise EscError(f"{port.path}: unexpected firmware current range")
+    # Powered-cart mode may configure an idle ESC supplied only through USB.
+    # Firmware voltage limits remain unchanged; arming is gated on both real
+    # bus voltages in power_drive. Overvoltage is always an error.
+    if not (allow_standby and 0 <= int(status['bus_mV']) < bus_limits[0]):
+        check_bus_voltage(port.path, status, bus_limits)
+    if not 50 <= int(status.get('ntc','0')) <= settings['ntc_trip_raw']:
+        raise EscError(f"{port.path}: NTC outside configured limits 50..{settings['ntc_trip_raw']}; measured={status.get('ntc','missing')} (raw ADC)")
     if motor.resistance_ohm is not None:
         # params has no ACK. The following cartcap reply proves the MCU has
         # processed params and that older periodic status lines have passed.
@@ -180,15 +251,19 @@ def prepare(port, motor: MotorSettings) -> dict[str, str]:
     if int(status["R_mOhm"]) <= 0 or int(status["L_uH"]) <= 0:
         raise EscError(f"{port.path}: R/L unset; configure measured values for this motor")
     exchange(port, "hfi off", lambda lines: any(line.startswith("hfi=") for line in lines))
-    return status
+    if status.get('config_id') != str(config_id):
+        raise EscError(f'{port.path}: ESC configuration lost during startup')
+    return PreparedEsc(status, bus_limits, config_id, settings)
 
 
 class Wheel:
     """Nonblocking arm/start/speed/stop state machine, one outstanding rpm ACK."""
 
-    def __init__(self, port, config: Config):
+    def __init__(self, port, config: Config, *, bus_limits_mv=(18000, 22000), config_id=None):
         self.port = port
         self.config = config
+        self.bus_limits_mv = bus_limits_mv
+        self.config_id = config_id
         self.phase = "stopped"
         self.deadline = 0.0
         self.last_status_at = 0.0
@@ -203,14 +278,25 @@ class Wheel:
         self.last_status: dict[str, str] | None = None
         self.direction = 1
         self.clearing_observer = False
+        self.awaiting_fault_since = None
 
     def receive(self, now: float):
+        clearing_on_entry = self.phase == 'stopping' and self.clearing_observer
         observed_fault = None
+        rejected_observer = False
+        fatal_reply = None
         for line in self.port.read_lines():
             if line.startswith("ERR") or line == "drive=rejected":
-                raise EscError(f"{self.port.path}: {line}")
+                if (line.startswith('ERR rpm requires active runrpm; ')
+                        and 'fault=observer_lock' in line.split()):
+                    rejected_observer = True
+                else:
+                    fatal_reply = line
+                continue
             status = parse_status(line)
             if status is not None:
+                if self.config_id is not None and status.get('config_id') != str(self.config_id):
+                    raise EscError(f'{self.port.path}: ESC configuration changed or reset; restart drive to reapply JSON')
                 count = int(status["n"])
                 if self.last_count is not None and count < self.last_count:
                     raise EscError(f"{self.port.path}: ESC rebooted")
@@ -259,8 +345,24 @@ class Wheel:
                 if int(line.split("=", 1)[1]) != self.pending_rpm:
                     raise EscError(f"{self.port.path}: wrong speed acknowledgment")
                 self.pending_rpm = None
-        if observed_fault is not None:
+        if observed_fault is not None and not observed_fault.recoverable:
+            self.awaiting_fault_since = None
             raise observed_fault
+        if fatal_reply is not None:
+            raise EscError(f"{self.port.path}: {fatal_reply}")
+        if observed_fault is not None:
+            self.awaiting_fault_since = None
+            raise observed_fault
+        if rejected_observer and not clearing_on_entry:
+            if self.awaiting_fault_since is None:
+                # The ERR can arrive before the full fault frame, including
+                # across USB reads. Request proof of the PWM-off fault; never
+                # construct a fictitious status from the short error reply.
+                self.awaiting_fault_since = now
+                self.pending_rpm = None
+                self.port.send('status')
+        if self.awaiting_fault_since is not None and now-self.awaiting_fault_since > .25:
+            raise EscError(f'{self.port.path}: rejected speed command without confirmed fault status')
 
     def update(self, target_rpm: float, now: float, *, enabled=True):
         cfg = self.config.drive
@@ -274,6 +376,8 @@ class Wheel:
                 self.stop(now)
             self._check_deadlines(now)
             return
+        if self.awaiting_fault_since is not None:
+            return  # EscPair has stopped the peer while the fault frame arrives.
         self._check_deadlines(now)
         if self.phase == "stopping":
             return
@@ -297,7 +401,7 @@ class Wheel:
             self.phase = "starting"
             self.deadline = now + .4
             self.active_seen = False
-        elif (self.phase == "running" and self.pending_rpm is None and now - self.last_rpm_at >= .02
+        elif (self.phase == "running" and self.pending_rpm is None and now - self.last_rpm_at >= .01
               and millirpm != self.last_sent_rpm):
             # Protocol 4 accepts zero and opposite signs; the ESC brakes first.
             # One ACK in flight; intermediate stick positions are never queued.
@@ -331,25 +435,56 @@ class Wheel:
         self.arm_ack = False
         self.active_seen = False
         self.clearing_observer = clearing_observer
+        self.awaiting_fault_since = None
 
 
 class EscPair:
-    def __init__(self, config: Config, port_factory=SerialPort):
+    def __init__(self, config: Config, port_factory=SerialPort, *, service=None, allow_standby=False):
         self.config = config
+        self.allow_standby = allow_standby
         self.ports = []
         self.wheels = []
         self._initialize_recovery()
+        self.speed_sync = WheelSync(config.drive)
         try:
-            self.ports = open_ports(config, port_factory)
+            def factory(path, baudrate):
+                port = port_factory(path, baudrate)
+                if service is not None:
+                    port.service = service
+                return port
+            self.ports = open_ports(config, factory, service=service)
             # Stop BOTH before doing any handshake which might take time.
             for port in self.ports:
                 port.stop()
-            for port, motor in zip(self.ports, (config.left_motor, config.right_motor)):
-                prepare(port, motor)
-                self.wheels.append(Wheel(port, config))
+            for side, port, motor, settings in zip(('left', 'right'), self.ports,
+                    (config.left_motor, config.right_motor),
+                    (config.left_esc or config.esc, config.right_esc or config.esc)):
+                try:
+                    prepared = prepare(port, motor, settings.wire(config.drive), allow_standby=allow_standby)
+                except EscError as exc:
+                    serial_id = getattr(config, side + '_serial') or '(path configured)'
+                    raise EscError(f'{side} ESC serial={serial_id}: {exc}') from exc
+                wheel = Wheel(port, config, bus_limits_mv=prepared.bus_limits_mv, config_id=prepared.config_id)
+                if allow_standby:
+                    wheel.last_status = prepared.status
+                    wheel.last_count = int(prepared.status['n'])
+                    wheel.last_status_at = time.monotonic()
+                self.wheels.append(wheel)
+            self.standby_poll_at = 0.0
+            for port in self.ports:
+                port.service = None
         except BaseException:
             self.close()
             raise
+
+    def poll_standby(self, now):
+        """Refresh idle bus voltages without arming or lowering any ESC limit."""
+        for wheel in self.wheels:
+            wheel.receive(now)
+        if now >= self.standby_poll_at:
+            for port in self.ports:
+                port.send('status')
+            self.standby_poll_at = now + .2
 
     def _initialize_recovery(self):
         self.retry_after = 0.0
@@ -362,10 +497,10 @@ class EscPair:
 
     def recovery_display(self, now):
         if self.retry_blocked:
-            return "RECOVERY_LIMIT", "再始動失敗が続いたため待機。LB解放・中立から再操作"
+            return "RECOVERY_LIMIT", "再始動失敗が続いたため待機。両スティック中立・十字キー解放から再操作"
         if now < self.retry_after:
             return "RECOVERING", (f"observer_lock 復帰待ち {self.retry_after-now:.1f}秒 "
-                                  f"試行{self.retry_count}/{self.config.drive.observer_retry_limit}（LB解放で取消）")
+                                  f"試行{self.retry_count}/{self.config.drive.observer_retry_limit}（両スティック中立・十字キー解放で取消）")
         return None
 
     def _record_fault(self, fault, now):
@@ -386,7 +521,7 @@ class EscPair:
         self.healthy_since = None
         if self.retry_count >= self.config.drive.observer_retry_limit:
             self.retry_blocked = True
-            self.notices.append("RECOVERY_LIMIT: observer_lock が続いたため再操作待ち。LB解放・中立から再操作してください。")
+            self.notices.append("RECOVERY_LIMIT: observer_lock が続いたため再操作待ち。両スティック中立・十字キー解放から再操作してください。")
         else:
             self.retry_count += 1
             paths = ", ".join(fault.path for fault in faults)
@@ -399,8 +534,9 @@ class EscPair:
             if wheel.phase != "stopped" or status is None or now-wheel.last_status_at > .35:
                 raise EscError(f"{wheel.port.path}: recovery needs fresh PWM-off status")
             check_stopped(status)
-            if status.get("cart_protocol") != "4" or not 18000 <= int(status['bus_mV']) <= 22000:
-                raise EscError(f"{wheel.port.path}: recovery firmware/supply check failed")
+            if status.get("cart_protocol") != "4":
+                raise EscError(f"{wheel.port.path}: recovery firmware check failed")
+            check_bus_voltage(wheel.port.path, status, wheel.bus_limits_mv, context="recovery supply")
             r, l = int(status['R_mOhm']), int(status['L_uH'])
             if r <= 0 or l <= 0 or (motor.resistance_ohm is not None and
                     (abs(r-motor.resistance_ohm*1000) > 1 or abs(l-motor.inductance_h*1e6) > 1)):
@@ -421,9 +557,28 @@ class EscPair:
                 if fatal is not None or self.config.drive.observer_retry_limit == 0:
                     raise fatal or faults[0]
                 self._begin_recovery(faults, now)
-            if not output.enabled:
-                # Cancellation is immediate. Keep the cooldown even if a new LB
-                # hold arrives, but never retain a movement command for later.
+            if getattr(self, 'allow_standby', False) and not all(
+                    w.last_status is not None and now-w.last_status_at <= .5 and
+                    w.bus_limits_mv[0] <= int(w.last_status['bus_mV']) <= w.bus_limits_mv[1]
+                    for w in self.wheels):
+                # Defense in depth: accepting USB-only preflight must never
+                # make arm/runrpm possible until both drive supplies are valid.
+                output = Output(reason='WAIT_POWER')
+            if any(w.awaiting_fault_since is not None for w in self.wheels):
+                # Stop the healthy peer immediately. Leave the rejecting ESC's
+                # diagnostic state intact until its full fault report arrives.
+                # No new speed/arm/ping is sent to that ESC while waiting.
+                for wheel in self.wheels:
+                    if (not output.enabled or not (output.left_rpm or output.right_rpm)
+                            or (wheel.awaiting_fault_since is None and wheel.phase not in ('stopped','stopping'))):
+                        wheel.stop(now)
+                self.speed_sync.reset()
+                self.speed_sync.reason = 'FAULT_STATUS_WAIT'
+                return
+            motion_requested = output.enabled and bool(output.left_rpm or output.right_rpm)
+            if not motion_requested:
+                # Neutral cancels retries too; never retain an old movement.
+                # Preserve cooldown if another command arrives immediately.
                 if self.retry_count or self.retry_blocked:
                     self.notices.append("RECOVERY_CANCELLED: 再始動を取り消しました。")
                 self.retry_count = 0
@@ -434,14 +589,18 @@ class EscPair:
                 for port in self.ports:
                     port.send("status")
                 self.recovery_poll_at = now + .25
-            if self.retry_after and not waiting and not output.enabled:
+            if self.retry_after and not waiting and not motion_requested:
                 self.retry_after = 0
-            if output.enabled and not waiting and not self.retry_blocked and self.retry_after:
+            if motion_requested and not waiting and not self.retry_blocked and self.retry_after:
                 self._check_recovery_ready(now)
                 self.retry_after = 0
                 self.notices.append("RECOVERY_RESTART: 最新のスティック指令で再始動します。")
             enabled = output.enabled and not waiting and not self.retry_blocked
-            targets = (output.left_rpm, output.right_rpm) if enabled else (0.0, 0.0)
+            if enabled and any(not math.isfinite(value) or (value != 0 and not
+                    self.config.drive.min_speed_rpm <= abs(value) <= self.config.drive.max_speed_rpm)
+                    for value in (output.left_rpm, output.right_rpm)):
+                raise EscError("Speed outside supported range")
+            targets = self.speed_sync.update(output, self.wheels, now, enabled=enabled)
             for wheel, target in zip(self.wheels, targets):
                 wheel.update(target, now, enabled=enabled)
             if enabled and all(w.phase == "running" and (w.last_status or {}).get("state") == "closed"

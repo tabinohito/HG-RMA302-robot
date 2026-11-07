@@ -1,0 +1,17 @@
+{
+  "source": "/home/tako/src/pico_esp32_bridge",
+  "files": {
+    "bridge_config.h": "0fd9165d176d8c2e5eabddab84a84c0d096c93664dbf10d87a2af7f0b12f494a",
+    "pico_sdk_import.cmake": "e3478dcf0dbff2a6eccdd8a3ad6788da3e8ea3617181cdb8784193f52946166c",
+    "src/power_master.c": "f3ee8b7beaf0a49a8970a3abed53c52f17332ee6088dd36e331cdedfe33fb73b",
+    "src/power_relay.h": "8d99a5fced029a2338698dac7226fd7fa5186a1902ec2ee577dddd141df73866",
+    "src/ina226.h": "b094c444ab3d547d8b528eda8fe3e4d31e5078dcfffebf8afe7a8234a8b35708",
+    "power/monitor.h": "8475daea1602bd93023b5c861a1baeb46cecee89fcfb14aba279eeb2958ebcca",
+    "power/panel_link.h": "179858002d675cf7b1204a4f2231165be1409b00a99bc9b3f4ba5eae2bf2b9c9",
+    "power/power_config.h": "eefc9204f06f40fa4d9a2b518cab3eb6916f1fe7d88e516052b0742a5edac487",
+    "panel/panel_test.h": "f7bc1b78005f5f71d4e193d829485943cc2d34d41a82504e64e9511f933f1447",
+    "panel/panel_client.h": "76db01dbc467a9d1f868ecd7d9ac81aff1a2ffef8ea20c5f4ef8a577b8c52370",
+    "third_party/pico-examples-LICENSE.txt": "483f865953435b66c443dee7558debe3cc3cf8fcbb6a112fd9fc6a795d53f1f6",
+    "esp32_panel_slave/src/main.cpp": "c0d8f78bee6a98848e75d3d5b099127079f89dd90deb6a80b1021b47d03cbb32"
+  }
+}

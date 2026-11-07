@@ -62,7 +62,7 @@ def _error_number(exc):
     return None
 
 
-def open_ports(config: Config, port_factory):
+def open_ports(config: Config, port_factory, *, service=None):
     """Wait for re-enumeration, open both exclusively, recheck identity.
 
     Sends no UART commands. All retrying is confined to initial connection;
@@ -70,6 +70,8 @@ def open_ports(config: Config, port_factory):
     """
     deadline = time.monotonic() + config.connect_timeout_s
     while True:
+        if service:
+            service()
         opened = []
         path = "ESC"
         try:
@@ -122,6 +124,10 @@ def serial_device_report(config: Config | None = None) -> list[dict]:
                 if ((serial_id is not None and port.vid == STMICRO_VID and port.serial_number == serial_id) or
                         (serial_id is None and path and os.path.realpath(path) == os.path.realpath(port.device))):
                     roles.append(side)
+            p=config.power
+            if ((p.serial and port.vid==0x2e8a and port.pid==0x000a and port.serial_number==p.serial) or
+                    (not p.serial and p.port and os.path.realpath(p.port)==os.path.realpath(port.device))):
+                roles.append('power')
         result.append({"path": port.device, "serial": port.serial_number, "role": ",".join(roles) or None,
                        "usb_id": f"{port.vid:04x}:{port.pid:04x}" if port.pid is not None else None,
                        "description": port.description})

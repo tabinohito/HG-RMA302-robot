@@ -1,0 +1,455 @@
+{
+  "source": "drive-20261105T113711.062613Z.jsonl",
+  "samples": [
+    {
+      "monotonic_s": 11847.665730684,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": 0,
+        "dpad_y": 1,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11847.563893,
+        "connected": true,
+        "last_device_check_at": 11847.665715487
+      },
+      "output": {
+        "left_rpm": 50.0,
+        "right_rpm": -50.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "arming",
+          "last_sent_mrpm": null,
+          "status_age_s": 0.48808463500063226,
+          "status": {
+            "state": "idle",
+            "fault": "none",
+            "MOE": "0",
+            "speed_mode": "0",
+            "uart_direction": "-1",
+            "req_mrpm": "0",
+            "est_mrpm": "0"
+          }
+        },
+        "right": {
+          "phase": "arming",
+          "last_sent_mrpm": null,
+          "status_age_s": 0.8117900110009941,
+          "status": {
+            "state": "idle",
+            "fault": "none",
+            "MOE": "0",
+            "speed_mode": "0",
+            "uart_direction": "1",
+            "req_mrpm": "0",
+            "est_mrpm": "0"
+          }
+        }
+      }
+    },
+    {
+      "monotonic_s": 11848.661400722,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": 0,
+        "dpad_y": 1,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11847.563893,
+        "connected": true,
+        "last_device_check_at": 11848.661388556
+      },
+      "output": {
+        "left_rpm": 50.0,
+        "right_rpm": -50.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "running",
+          "last_sent_mrpm": 50000,
+          "status_age_s": 0.06082227499973669,
+          "status": {
+            "state": "ramp",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "1",
+            "req_mrpm": "50000",
+            "est_mrpm": "4988"
+          }
+        },
+        "right": {
+          "phase": "running",
+          "last_sent_mrpm": -50000,
+          "status_age_s": 0.06082227499973669,
+          "status": {
+            "state": "ramp",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "-1",
+            "req_mrpm": "-50000",
+            "est_mrpm": "-5451"
+          }
+        }
+      }
+    },
+    {
+      "monotonic_s": 11849.657308516,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": 0,
+        "dpad_y": 1,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11847.563893,
+        "connected": true,
+        "last_device_check_at": 11849.65729446
+      },
+      "output": {
+        "left_rpm": 50.0,
+        "right_rpm": -50.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "running",
+          "last_sent_mrpm": 50000,
+          "status_age_s": 0.06098421199931181,
+          "status": {
+            "state": "closed",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "1",
+            "req_mrpm": "50000",
+            "est_mrpm": "22654"
+          }
+        },
+        "right": {
+          "phase": "running",
+          "last_sent_mrpm": -50000,
+          "status_age_s": 0.04081279700039886,
+          "status": {
+            "state": "ramp",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "-1",
+            "req_mrpm": "-50000",
+            "est_mrpm": "-8175"
+          }
+        }
+      }
+    },
+    {
+      "monotonic_s": 11850.672944847,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": 0,
+        "dpad_y": 1,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11847.563893,
+        "connected": true,
+        "last_device_check_at": 11850.672932603
+      },
+      "output": {
+        "left_rpm": 50.0,
+        "right_rpm": -50.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "running",
+          "last_sent_mrpm": 50000,
+          "status_age_s": 0.06117498399908072,
+          "status": {
+            "state": "closed",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "1",
+            "req_mrpm": "50000",
+            "est_mrpm": "31124"
+          }
+        },
+        "right": {
+          "phase": "running",
+          "last_sent_mrpm": -50000,
+          "status_age_s": 0.06117498399908072,
+          "status": {
+            "state": "ramp",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "-1",
+            "req_mrpm": "-50000",
+            "est_mrpm": "-7854"
+          }
+        }
+      }
+    },
+    {
+      "monotonic_s": 11852.153904116,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": 0,
+        "dpad_y": 1,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11847.563893,
+        "connected": true,
+        "last_device_check_at": 11852.153887127
+      },
+      "output": {
+        "left_rpm": 50.0,
+        "right_rpm": -50.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "running",
+          "last_sent_mrpm": 50000,
+          "status_age_s": 0.040508778000003076,
+          "status": {
+            "state": "closed",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "1",
+            "req_mrpm": "50000",
+            "est_mrpm": "31089"
+          }
+        },
+        "right": {
+          "phase": "running",
+          "last_sent_mrpm": -50000,
+          "status_age_s": 0.040508778000003076,
+          "status": {
+            "state": "ramp",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "-1",
+            "req_mrpm": "-50000",
+            "est_mrpm": "-8460"
+          }
+        }
+      }
+    },
+    {
+      "monotonic_s": 11861.754868565,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": 0,
+        "dpad_y": -1,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11859.66051,
+        "connected": true,
+        "last_device_check_at": 11861.754851093
+      },
+      "output": {
+        "left_rpm": -50.0,
+        "right_rpm": 50.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "running",
+          "last_sent_mrpm": -50000,
+          "status_age_s": 0.06092744799934735,
+          "status": {
+            "state": "closed",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "-1",
+            "req_mrpm": "-50000",
+            "est_mrpm": "-21986"
+          }
+        },
+        "right": {
+          "phase": "running",
+          "last_sent_mrpm": 50000,
+          "status_age_s": 0.06092744799934735,
+          "status": {
+            "state": "ramp",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "1",
+            "req_mrpm": "50000",
+            "est_mrpm": "7640"
+          }
+        }
+      }
+    },
+    {
+      "monotonic_s": 11863.155458519,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": 0,
+        "dpad_y": -1,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11859.66051,
+        "connected": true,
+        "last_device_check_at": 11863.15545201
+      },
+      "output": {
+        "left_rpm": -50.0,
+        "right_rpm": 50.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "running",
+          "last_sent_mrpm": -50000,
+          "status_age_s": 0.06071913900086656,
+          "status": {
+            "state": "closed",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "-1",
+            "req_mrpm": "-50000",
+            "est_mrpm": "-31115"
+          }
+        },
+        "right": {
+          "phase": "running",
+          "last_sent_mrpm": 50000,
+          "status_age_s": 0.06071913900086656,
+          "status": {
+            "state": "ramp",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "1",
+            "req_mrpm": "50000",
+            "est_mrpm": "8796"
+          }
+        }
+      }
+    },
+    {
+      "monotonic_s": 11866.770422563,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": -1,
+        "dpad_y": 0,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11864.124709,
+        "connected": true,
+        "last_device_check_at": 11866.770406589
+      },
+      "output": {
+        "left_rpm": -25.0,
+        "right_rpm": -25.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "running",
+          "last_sent_mrpm": -25000,
+          "status_age_s": 0.06117719500070962,
+          "status": {
+            "state": "closed",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "-1",
+            "req_mrpm": "-25000",
+            "est_mrpm": "-25092"
+          }
+        },
+        "right": {
+          "phase": "running",
+          "last_sent_mrpm": -25000,
+          "status_age_s": 0.06117719500070962,
+          "status": {
+            "state": "closed",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "-1",
+            "req_mrpm": "-25000",
+            "est_mrpm": "-25191"
+          }
+        }
+      }
+    },
+    {
+      "monotonic_s": 11871.155382761,
+      "input": {
+        "left_stick": 1.5259021896696368e-05,
+        "right_stick": 1.5259021896696368e-05,
+        "dpad_x": 1,
+        "dpad_y": 0,
+        "estop": false,
+        "reset": false,
+        "last_input_at": 11868.088728,
+        "connected": true,
+        "last_device_check_at": 11871.155365164
+      },
+      "output": {
+        "left_rpm": 25.0,
+        "right_rpm": 25.0,
+        "enabled": true,
+        "reason": "DRIVING"
+      },
+      "wheels": {
+        "left": {
+          "phase": "running",
+          "last_sent_mrpm": 25000,
+          "status_age_s": 0.061079597000571084,
+          "status": {
+            "state": "closed",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "1",
+            "req_mrpm": "25000",
+            "est_mrpm": "24963"
+          }
+        },
+        "right": {
+          "phase": "running",
+          "last_sent_mrpm": 25000,
+          "status_age_s": 0.061079597000571084,
+          "status": {
+            "state": "ramp",
+            "fault": "none",
+            "MOE": "1",
+            "speed_mode": "1",
+            "uart_direction": "1",
+            "req_mrpm": "25000",
+            "est_mrpm": "7695"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+--- a/Core/Inc/motor_board_config.hpp
++++ b/Core/Inc/motor_board_config.hpp
+@@ -5,7 +5,8 @@
+ constexpr bool enable_power_stage = true;
+ // Bus voltage window and phase protection are separate from the q-axis cap.
+ constexpr float pot_maximum_iq = 1.0f;
+-constexpr float bench_bus_min = 18.0f, bench_bus_max = 22.0f;
++// 6S Li-ion/LiPo: up to 25.2 V charged; 26 V is the overvoltage trip.
++constexpr float bench_bus_min = 18.0f, bench_bus_max = 26.0f;
+ constexpr float bench_phase_trip = 4.0f, bench_identify_voltage = 0.2f;
+ // Nominal wheel hypothesis supported by two 398-cycle/2-wheel-turn trials.
+ constexpr unsigned wheel_pole_pairs = 2;
+--- a/Core/Src/motor_control.cpp
++++ b/Core/Src/motor_control.cpp
+@@ -62,7 +62,7 @@
+ {
+   return std::isfinite(bus_min) && std::isfinite(bus_max) &&
+       std::isfinite(current) && std::isfinite(identify_voltage) &&
+-      bus_min >= 7 && bus_max > bus_min && bus_max <= 25 &&
++      bus_min >= 7 && bus_max > bus_min && bus_max <= 26 &&
+       current >= 0.1f && current <= 5 && identify_voltage > 0 &&
+       identify_voltage <= std::min(2.0f, bus_min * 0.15f);
+ }

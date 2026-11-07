@@ -1,0 +1,69 @@
+--- a/Core/Inc/cart_settings.hpp
++++ b/Core/Inc/cart_settings.hpp
+@@ -46,13 +46,13 @@
+         phase_trip_ma>=1000 && phase_trip_ma<=4000 &&
+         ntc_trip_raw>=1000 && ntc_trip_raw<=3200 &&
+         wheel_cycles_milli>=1000 && wheel_cycles_milli<=1000000 &&
+-        min_mrpm>=8000 && min_mrpm<=max_mrpm && max_mrpm<=25000 &&
++        min_mrpm>=8000 && min_mrpm<=max_mrpm && max_mrpm<=100000 &&
+         max_iq_ma>=100 && max_iq_ma<=2000 && max_iq_ma*2<=phase_trip_ma &&
+         max_slew_mrpm_s>=1000 && max_slew_mrpm_s<=20000 &&
+         startup_mrpm>=8000 && startup_mrpm<=min_mrpm &&
+         startup_ma>=100 && startup_ma<=1000 && startup_ma*2<=phase_trip_ma &&
+         uint64_t(startup_mrpm)*wheel_cycles_milli>=600000000ULL &&
+-        uint64_t(max_mrpm)*wheel_cycles_milli<=6000000000ULL &&
++        uint64_t(max_mrpm)*wheel_cycles_milli<=21600000000ULL &&
+         uint64_t(max_slew_mrpm_s)*wheel_cycles_milli<=6000000000ULL &&
+         sum_soft_ma>=300 && sum_soft_ma<=1500 && sum_hard_ma>sum_soft_ma && sum_hard_ma<=2000 &&
+         sum_trip_samples>=1 && sum_trip_samples<=40 &&
+--- a/Core/Inc/motor_speed.hpp
++++ b/Core/Inc/motor_speed.hpp
+@@ -9,15 +9,16 @@
+  public:
+   static constexpr float period=.001f, kp=.015f, ki=.05f;
+   bool start(float hz,float maximum_current,float slew_hz_per_s,bool responsive=false) {
+-    if (!std::isfinite(hz) || hz < 10 || hz > 100 ||
++    if (!std::isfinite(hz) || hz < 10 || hz > (responsive ? 360.f : 100.f) ||
+         !std::isfinite(maximum_current) || maximum_current <= 0 || maximum_current > 2 ||
+         !std::isfinite(slew_hz_per_s) || slew_hz_per_s <= 0 || slew_hz_per_s > 100) return false;
+     *this=SpeedLoop{}; requested=reference=hz; limit=maximum_current; slew=slew_hz_per_s;
++    maximum_hz_=responsive ? 360.f : 100.f;
+     kp_=responsive ? .04f : kp; ki_=responsive ? .2f : ki;
+     return true;
+   }
+   bool set_target(float hz) {
+-    if (!std::isfinite(hz) || hz < 10 || hz > 100 || limit <= 0) return false;
++    if (!std::isfinite(hz) || hz < 10 || hz > maximum_hz_ || limit <= 0) return false;
+     requested=hz; return true;
+   }
+   void engage(float measured_hz,float seed_current) {
+@@ -48,6 +49,7 @@
+   bool engaged=false;
+  private:
+   float integral_=0, kp_=kp, ki_=ki;
++  float maximum_hz_=100;
+   bool braking_=false;
+ };
+ }
+--- a/Core/Inc/motor_board_config.hpp
++++ b/Core/Inc/motor_board_config.hpp
+@@ -12,7 +12,7 @@
+ constexpr unsigned wheel_pole_pairs = 2;
+ constexpr float wheel_gear_ratio = 99.5f;
+ constexpr float wheel_electrical_cycles = wheel_pole_pairs*wheel_gear_ratio;
+-constexpr float wheel_min_rpm = 8, wheel_max_rpm = 25, wheel_slew_rpm_per_s = 20;
++constexpr float wheel_min_rpm = 8, wheel_max_rpm = 100, wheel_slew_rpm_per_s = 20;
+ constexpr float wheel_max_slew_rpm_per_s = 20;
+ constexpr float wheel_maximum_iq = 2.0f;
+ constexpr float electrical_hz_from_wheel_rpm(float rpm) { return rpm*wheel_electrical_cycles/60; }
+--- a/Core/Src/cppmain.cpp
++++ b/Core/Src/cppmain.cpp
+@@ -767,7 +767,7 @@
+   if (configure_cart(line)) return;
+   if (!strcmp(line, "cartcap")) {
+     printf("cart_protocol=4 signed_iq=1 signed_rpm=1 continuous_speed=1 controlled_reverse=1 controlled_zero=1 reverse_dwell_ms=2000 watchdog_ms=500 "
+-           "config_protocol=1 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
++           "config_protocol=1 supported_max_mrpm=100000 bus_min_mV=%ld bus_max_mV=%ld max_iq_mA=%ld phase_trip_mA=%ld "
+            "max_speed_iq_mA=%lu min_mrpm=%lu max_mrpm=%lu startup_mA=%lu slew_mrpm_s=%lu "
+            "max_slew_mrpm_s=%lu startup_target_mrpm=%lu live_target=1\r\n",
+            lroundf(limits.bus_min*1000), lroundf(limits.bus_max*1000),

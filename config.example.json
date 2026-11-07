@@ -17,13 +17,44 @@
     "left_sign": 1,
     "right_sign": -1,
     "min_speed_rpm": 8.0,
-    "max_speed_rpm": 25.0,
-    "acceleration_rpm_s": 20.0,
-    "steering_gain": 1.5,
+    "max_speed_rpm": 100.0,
+    "stick_max_speed_rpm": 30.0,
+    "acceleration_rpm_s": 30.0,
     "observer_retry_limit": 3,
-    "observer_retry_delay_s": 2.5
+    "observer_retry_delay_s": 2.5,
+    "dpad_drive_ratio": 0.5,
+    "dpad_turn_ratio": 0.25,
+    "dpad_smoothing_s": 0.05,
+    "stick_smoothing_s": 0.05
   },
   "left_serial": "0670FF343433464757213550",
   "right_serial": "0665FF535157808667132326",
-  "connect_timeout_s": 5.0
+  "connect_timeout_s": 5.0,
+  "esc": {
+    "bus_min_v": 18.0,
+    "bus_max_v": 26.0,
+    "phase_trip_a": 4.0,
+    "ntc_trip_raw": 2873,
+    "wheel_electrical_cycles": 199.0,
+    "startup_speed_rpm": 8.0,
+    "startup_current_a": 1.0,
+    "acceleration_ff_a": 0.3,
+    "current_sum_soft_a": 1.2,
+    "current_sum_hard_a": 2.0,
+    "current_sum_trip_samples": 10,
+    "startup_lock_bad_cost": 5,
+    "startup_lock_score": 2000,
+    "overspeed_filtered_ratio": 2.0,
+    "overspeed_raw_ratio": 3.0
+  },
+  "left_esc": {},
+  "right_esc": {},
+  "power": {
+    "enabled": false,
+    "serial": null,
+    "port": "",
+    "telemetry_timeout_s": 0.5,
+    "usb_min_v": 3.5,
+    "usb_max_v": 6.5
+  }
 }

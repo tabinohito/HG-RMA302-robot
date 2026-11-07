@@ -4,6 +4,8 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 from .control import DriveSettings
+from .esc_settings import EscSettings
+from .power_settings import PowerSettings
 
 
 @dataclass(frozen=True)
@@ -33,8 +35,15 @@ class Config:
     left_serial: str | None = None
     right_serial: str | None = None
     connect_timeout_s: float = 5.0
+    esc: EscSettings = EscSettings()
+    left_esc: EscSettings | None = None
+    right_esc: EscSettings | None = None
+    power: PowerSettings = PowerSettings()
 
     def __post_init__(self):
+        for settings in (self.esc, self.left_esc, self.right_esc):
+            if settings is not None:
+                settings.wire(self.drive)
         for key in ("left_serial", "right_serial"):
             value = getattr(self, key)
             if value is not None and (not isinstance(value, str) or not value or
@@ -59,6 +68,17 @@ def load_config(path: str) -> Config:
     drive = raw.pop("drive", {})
     if not isinstance(drive, dict):
         raise ValueError("drive must be a JSON object")
+    esc = raw.pop('esc', {})
+    power = raw.pop('power', {})
+    if not isinstance(power, dict):
+        raise ValueError('power must be a JSON object')
+    raw['power'] = PowerSettings(**power)
+    if not isinstance(esc, dict):
+        raise ValueError('esc must be a JSON object')
+    raw['esc'] = EscSettings(**esc)
+    for key in ('left_esc', 'right_esc'):
+        if key in raw:
+            raw[key] = raw['esc'].overlay(raw[key])
     for key in ("left_motor", "right_motor"):
         motor = raw.pop(key, {})
         if not isinstance(motor, dict):
