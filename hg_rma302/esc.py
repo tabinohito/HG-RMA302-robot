@@ -442,6 +442,7 @@ class EscPair:
     def __init__(self, config: Config, port_factory=SerialPort, *, service=None, allow_standby=False):
         self.config = config
         self.allow_standby = allow_standby
+        self.yaw_feedback = None
         self.ports = []
         self.wheels = []
         self._initialize_recovery()
@@ -600,7 +601,10 @@ class EscPair:
                     self.config.drive.min_speed_rpm <= abs(value) <= self.config.drive.max_speed_rpm)
                     for value in (output.left_rpm, output.right_rpm)):
                 raise EscError("Speed outside supported range")
-            targets = self.speed_sync.update(output, self.wheels, now, enabled=enabled)
+            targets = self.speed_sync.update(output, self.wheels, now, enabled=enabled,
+                                             yaw_control=getattr(self,'yaw_feedback',None) is not None)
+            if getattr(self, "yaw_feedback", None) is not None:
+                targets = self.yaw_feedback.correct(targets, output, self.wheels, now)
             for wheel, target in zip(self.wheels, targets):
                 wheel.update(target, now, enabled=enabled)
             if enabled and all(w.phase == "running" and (w.last_status or {}).get("state") == "closed"

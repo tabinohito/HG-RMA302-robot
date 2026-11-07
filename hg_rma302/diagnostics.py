@@ -68,7 +68,7 @@ class DriveLog:
         except queue.Full:
             self.dropped_records += 1
 
-    def snapshot(self, sample, output, pair, now, *, kind="sample", power=None):
+    def snapshot(self, sample, output, pair, now, *, kind="sample", power=None, imu=None):
         wheels = {}
         if pair:
             for side, wheel in zip(("left", "right"), pair.wheels):
@@ -82,6 +82,7 @@ class DriveLog:
                 }
         self.record(kind, now=now,
                     **({'power': power.snapshot(now)} if power is not None else {}),
+                    **({'imu': imu.snapshot(now)} if imu is not None else {}),
                     input=asdict(sample) if sample is not None else None,
                     output=asdict(output) if output is not None else None,
                     wheels=wheels,

@@ -11,7 +11,7 @@ from hg_rma302.control import DriveSettings, DriveController, InputState
 def status(**changes):
     d=dict(online=1,power=0,relay=0,ina=1,mode='V',mv=5000,ua=-100,mw=0,sw=1,dropped=0,
            power_protocol=1,session=17,seq=1,uptime_ms=1000,estop=0,host_state='USB_ONLY',
-           stop_reason='none',sample_age_ms=50,current_valid=1,shunt_raw=-4,led_rgb=8,keys=0)
+           stop_reason='none',sample_age_ms=50,current_valid=1,shunt_raw=-4,led_rgb=8,keys=0,drive_mode="tank",mode_led_rgb=2060)
     d.update(changes)
     return ' '.join(f'{k}={v}' for k,v in d.items())
 
@@ -27,7 +27,7 @@ class Board:
     def send(self,command):
         self.sent.append(command);parts=command.split()
         if command=='cap':
-            self.lines.append('power_protocol=1 watchdog_ms=750 remote_on=0 led_state=1 estop_latch=1 shunt_uohm=100000')
+            self.lines.append('power_protocol=1 watchdog_ms=750 remote_on=0 led_state=1 estop_latch=1 drive_modes=1 shunt_uohm=100000')
         elif parts[0]=='claim':
             self.session=int(parts[1]);self.lines.append(f'OK claim={self.session}')
         elif parts[0]=='host':

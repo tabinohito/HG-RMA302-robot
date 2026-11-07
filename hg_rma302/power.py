@@ -42,7 +42,7 @@ def parse_power_status(line):
     d=fields(line)
     required={'online','power','relay','ina','mode','mv','ua','mw','sw','dropped',
               'power_protocol','session','seq','uptime_ms','estop','host_state','stop_reason',
-              'sample_age_ms','current_valid','shunt_raw','led_rgb','keys'}
+              'sample_age_ms','current_valid','shunt_raw','led_rgb','keys','drive_mode','mode_led_rgb'}
     if not required <= d.keys() or d['power_protocol']!='1':
         raise PowerError('Pico needs the embedded/pico_power_master firmware (power_protocol=1)')
     try:
@@ -51,9 +51,9 @@ def parse_power_status(line):
         for key in ('session','seq','uptime_ms','sample_age_ms','dropped','led_rgb','keys'):
             if not d[key].isascii() or not d[key].isdecimal() or not 0 <= int(d[key]) <= 0xffffffff:
                 raise ValueError(key)
-        if d['mode'] not in ('V','I','P') or d['host_state'] not in STATES:
+        if d['mode'] not in ('V','I','P') or d['host_state'] not in STATES or d['drive_mode'] not in ('tank','joystick'):
             raise ValueError('mode/state')
-        if not -32768 <= int(d['shunt_raw']) <= 32767 or int(d['led_rgb']) > 0xffffff or int(d['keys']) > 7:
+        if not -32768 <= int(d['shunt_raw']) <= 32767 or not 0<=int(d['mode_led_rgb'])<=0xffffff or int(d['led_rgb']) > 0xffffff or int(d['keys']) > 7:
             raise ValueError('sensor/LED/keys')
         if d['power'] != d['relay'] or (d['estop']=='1' and d['relay']!='0'):
             raise ValueError('relay/estop mismatch')
@@ -114,8 +114,9 @@ class PowerLink:
             self.clear_pending=True
             self.clear_sent_at=self.last_poll_at
 
-    def poll(self, now, state='BOOT'):
+    def poll(self, now, state='BOOT', mode='tank'):
         self.last_poll_at=now
+        if mode not in ('tank','joystick'):raise ValueError('Unknown drive mode')
         if state not in STATES:
             raise ValueError('Unknown host LED state')
         for line in self.port.read_lines():
@@ -129,7 +130,7 @@ class PowerLink:
                 cap=fields(line)
                 if self.phase!='hello': continue
                 if any(cap.get(k)!=v for k,v in {'power_protocol':'1','watchdog_ms':'750',
-                        'remote_on':'0','led_state':'1','estop_latch':'1','shunt_uohm':'100000'}.items()):
+                        'remote_on':'0','led_state':'1','estop_latch':'1','drive_modes':'1','shunt_uohm':'100000'}.items()):
                     raise PowerError('Incompatible Pico power firmware')
                 self.port.send(f'claim {self.session}')
                 self.phase='claiming';self.deadline=now+1
@@ -174,7 +175,7 @@ class PowerLink:
             if self.sequence==0xffffffff:
                 raise PowerError('Pico host sequence exhausted; restart drive')
             self.sequence+=1
-            self.port.send(f'host {self.session} {self.sequence} {state}')
+            self.port.send(f'host {self.session} {self.sequence} {state} {mode}')
             self.pending_seq=self.sequence;self.pending_at=now;self.last_heartbeat=now
 
     def snapshot(self,now):

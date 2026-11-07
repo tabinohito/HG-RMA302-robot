@@ -239,10 +239,9 @@ class DecoderTests(unittest.TestCase):
         self.decoder.feed(EV_ABS,ABS_HAT0Y,0,4)
         self.assertEqual(self.decoder.feed(EV_SYN,0,0,4).dpad_y,0)
 
-    def test_horizontal_axes_and_lb_do_not_affect_commands(self):
+    def test_lb_does_not_affect_commands(self):
         before=self.decoder.state
-        for kind,code,value in ((EV_ABS,ABS_X,32767),(EV_ABS,3,-32768),
-                                (EV_KEY,BTN_LB,1),(EV_KEY,BTN_LB,2),(EV_KEY,BTN_LB,0)):
+        for kind,code,value in ((EV_KEY,BTN_LB,1),(EV_KEY,BTN_LB,2),(EV_KEY,BTN_LB,0)):
             self.decoder.feed(kind,code,value,5)
             self.assertIsNone(self.decoder.feed(EV_SYN,0,0,5))
         self.assertEqual(self.decoder.state,before)

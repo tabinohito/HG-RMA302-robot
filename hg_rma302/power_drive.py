@@ -1,7 +1,8 @@
 """Main-thread power interlocks, input servicing and ESC driving."""
 import signal
 import time
-from .control import DriveController, Output
+from .control import DriveController, Output, controls_neutral
+from .imu import ImuLink, YawFeedback, ImuError
 from .esc import EscPair, EscFault
 from .gamepad import Gamepad
 from .power import PowerLink, PowerError
@@ -41,12 +42,13 @@ def power_gate(config, power, pair, now):
 
 def led_state(reason):
     if reason in ('STOP_LATCHED', *INPUT_FAILURES): return 'STOPPED'
+    if reason in ('IMU_WAIT','IMU_CALIBRATING'): return 'RECOVERING'
     if reason=='USB_ONLY': return 'USB_ONLY'
     if reason in ('WAIT_POWER','WAIT_ESC_STATUS'): return 'WAIT_POWER'
     if reason in ('POWER_SENSOR_FAULT','ERROR'): return 'FAULT'
     if reason in ('POWER_CONNECTING','ESC_CONNECTING'): return 'BOOT'
     if reason and (reason.startswith('RECOVER') or reason=='FAULT_STATUS_WAIT'): return 'RECOVERING'
-    if reason in ('DRIVING','WAITING_FOR_WHEEL','WAITING_FOR_BOTH_WHEELS'): return 'DRIVING'
+    if reason in ('DRIVING','WAITING_FOR_WHEEL','WAITING_FOR_BOTH_WHEELS','WAITING_FOR_WHEELS'): return 'DRIVING'
     return 'READY'
 
 
@@ -56,7 +58,7 @@ class _Finished(Exception):
 
 def run_powered(config, *, seconds=None, logger=None):
     from .cli import report_esc_events
-    pair=power=pad=None
+    pair=power=pad=imu=yaw=None
     controller=None
     output=Output()
     display_reason='POWER_CONNECTING'
@@ -91,8 +93,7 @@ def run_powered(config, *, seconds=None, logger=None):
     def handle_input(sample,now):
         nonlocal output,previous_reset,display_reason
         output=controller.update(sample,now)
-        neutral=(abs(sample.left_stick)<=config.drive.deadzone and abs(sample.right_stick)<=config.drive.deadzone
-                 and not sample.dpad_x and not sample.dpad_y)
+        neutral=controls_neutral(sample,config.drive)
         reset_edge=sample.reset and not previous_reset
         previous_reset=sample.reset
         if sample.estop or output.reason in INPUT_FAILURES:
@@ -111,13 +112,14 @@ def run_powered(config, *, seconds=None, logger=None):
         if stopped or (seconds is not None and now-started>=seconds):
             if not stopped: stop_reason='duration'
             raise _Finished
+        if imu: imu.poll(now)
         frames=pad.read()
         now=time.monotonic()
         for sample in frames:
             handle_input(sample,now)
-            if logger: logger.snapshot(sample,output,pair,now,kind='input_frame',power=power)
+            if logger: logger.snapshot(sample,output,pair,now,kind='input_frame',power=power,imu=yaw)
         handle_input(pad.state,now)
-        power.poll(now,led_state(display_reason))
+        power.poll(now,led_state(display_reason),controller.mode)
         if power.estopped:
             drop_pair()
             output=controller.inhibit('STOP_LATCHED')
@@ -133,10 +135,14 @@ def run_powered(config, *, seconds=None, logger=None):
         device=pad.device
         print(f'Gamepad: {device.name} {device.path}',flush=True)
         power=PowerLink(config.power)
+        if config.imu.enabled:
+            imu=ImuLink(config.imu);yaw=YawFeedback(imu,config.drive)
+            print(f'IMU: {imu.path} / {config.imu.baudrate} baud。静止して校正を待ちます。',flush=True)
         print(f'Power: serial={config.power.serial or "(path)"} → {power.port.path}',flush=True)
-        print('左右スティック縦=各輪、十字キー=前後・旋回。B=ESC停止＋SSR OFF・停止保持。',flush=True)
+        print('Xboxロゴ=タンク/ジョイスティック切替。ジョイスティック: 左縦=前後、左横±0.2の外=曲がり、右横=旋回。',flush=True)
+        print('タンク: 左右縦=各輪。十字キーは両モード共通。B=ESC停止＋SSR OFF・停止保持。',flush=True)
         print('中立でStart=非常停止解除（SSRはOFFのまま）。駆動電源は物理ボタンで投入。約5 VはUSB給電待機。',flush=True)
-        print('LED: 待機=青、READY=水色、走行=緑、復帰待ち=橙、非常停止/異常=赤。Ctrl-C=SSR OFF・終了。',flush=True)
+        print('LED本体=走行状態、末尾6灯=タンク水色/ジョイスティック橙、非常停止は全灯赤。Ctrl-C=SSR OFF。',flush=True)
         if logger:
             logger.record('gamepad',name=device.name,path=device.path)
             logger.record('power_connected',serial=config.power.serial,path=power.port.path)
@@ -150,6 +156,8 @@ def run_powered(config, *, seconds=None, logger=None):
                     # service reads B/input and renews the power lease every
                     # wait cycle; blocked serial setup cannot freeze e-stop.
                     pair=EscPair(config,service=service,allow_standby=True)
+                    if yaw:
+                        yaw.reset();pair.yaw_feedback=yaw
                     output=controller.inhibit('CENTER_CONTROLS')
                     now=time.monotonic()
                     if logger: logger.record('esc_connected',devices={side:{'serial':getattr(config,side+'_serial'),'path':p.path}
@@ -160,6 +168,10 @@ def run_powered(config, *, seconds=None, logger=None):
                 if pair and all(w.phase=='stopped' for w in pair.wheels):
                     pair.poll_standby(now)
                 reason=power_gate(config,power,pair,now)
+                if not reason and imu:
+                    reason=imu.reason(now)
+                    if reason not in (None,"IMU_WAIT","IMU_CALIBRATING"):
+                        raise ImuError(reason)
                 if reason:
                     output=controller.inhibit(reason)
                     if reason=='POWER_SENSOR_FAULT': emergency()
@@ -182,7 +194,7 @@ def run_powered(config, *, seconds=None, logger=None):
                 raise
             now=time.monotonic()
             if logger and now-last_log>=.02:
-                logger.snapshot(pad.state,output,pair,now,power=power);last_log=now
+                logger.snapshot(pad.state,output,pair,now,power=power,imu=yaw);last_log=now
                 warning=logger.warning()
                 if warning: print(warning,flush=True)
             if now-last_print>=.25 or display_reason!=previous_reason:
@@ -193,8 +205,9 @@ def run_powered(config, *, seconds=None, logger=None):
                 if pair:
                     esc=' ESC='+','.join(f"{(w.last_status or {}).get('bus_mV','?')}mV/{(w.last_status or {}).get('state','?')}"
                                           for w in pair.wheels)
-                print(f'{display_reason:22} {voltage} {amps} SSR={int(p["ssr_command_on"])} '
-                      f'RPM_cmd L={output.left_rpm:+.2f} R={output.right_rpm:+.2f}{esc}',flush=True)
+                print(f'{controller.mode:8} {display_reason:22} {voltage} {amps} SSR={int(p["ssr_command_on"])} '
+                      f'RPM_cmd L={output.left_rpm:+.2f} R={output.right_rpm:+.2f}{esc}'
+                      +(f' IMU={imu.reason(now) or yaw.reason}' if imu else ''),flush=True)
                 last_print=now;previous_reason=display_reason
             time.sleep(max(0,.005-(time.monotonic()-now)))
     except _Finished:
@@ -203,7 +216,7 @@ def run_powered(config, *, seconds=None, logger=None):
         stop_reason='error'
         try: emergency()
         except Exception as exc: print(f'非常停止送信エラー: {exc}',flush=True)
-        if logger: logger.snapshot(pad.state if pad else None,output,pair,time.monotonic(),kind='error_snapshot',power=power)
+        if logger: logger.snapshot(pad.state if pad else None,output,pair,time.monotonic(),kind='error_snapshot',power=power,imu=yaw)
         raise
     finally:
         try:
@@ -215,6 +228,7 @@ def run_powered(config, *, seconds=None, logger=None):
                     if logger: logger.record('power_cleanup',stop_errors=errors)
                     for error in errors: print(error,flush=True)
             finally:
+                if imu: imu.close()
                 if pad: pad.close()
                 for s,handler in handlers.items(): signal.signal(s,handler)
                 if logger: logger.record('drive_exit',reason=stop_reason)

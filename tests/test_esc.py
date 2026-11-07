@@ -2,8 +2,9 @@ import unittest
 from unittest.mock import patch
 
 from hg_rma302.config import Config, MotorSettings, load_config
-from hg_rma302.control import DriveSettings, Output
+from hg_rma302.control import DriveController, DriveSettings, InputState, Output
 from hg_rma302.esc import EscError, EscPair, Wheel, parse_status, prepare
+from hg_rma302.wheel_sync import WheelSync
 
 
 def status(state="idle", count=100, direction=1, fault="none", **overrides):
@@ -236,6 +237,37 @@ class WheelTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(EscError, 'Speed outside supported range'):
                 pair.update(Output(value, 8, True), 0)
             self.assertTrue(all(port.sent == ['stop'] for port in pair.ports))
+
+    def test_recorded_joystick_turns_pass_esc_range_validation(self):
+        cases=(
+            dict(left_stick=-1,left_x=.48439765011062796),
+            dict(left_stick=.7500267032883192,right_x=-1),
+            dict(left_stick=.6328374151216907,left_x=1),
+        )
+        for sample in cases:
+            with self.subTest(sample=sample):
+                cfg=Config(DriveSettings(control_mode='joystick',max_speed_rpm=100,right_sign=-1))
+                controller=DriveController(cfg.drive)
+                controller.update(InputState(last_input_at=0),0)
+                output=controller.update(InputState(**sample,last_input_at=.01),.01)
+                self.assertTrue(output.enabled)
+                pair=EscPair.__new__(EscPair)
+                pair.config=cfg
+                pair.ports=[Port(),Port()]
+                pair.wheels=[Wheel(port,cfg) for port in pair.ports]
+                pair._initialize_recovery()
+                pair.speed_sync=WheelSync(cfg.drive)
+                pair.update(output,.01)
+                for wheel,target in zip(pair.wheels,(output.left_rpm,output.right_rpm)):
+                    if target:
+                        self.assertIn('arm',wheel.port.sent)
+                        wheel.port.lines=['armed for 5 s; ping required every <500 ms during drive']
+                        wheel.receive(.02)
+                        wheel.update(target,.02)
+                        self.assertIn(f'runrpm {target:.3f} 2 20',wheel.port.sent)
+                    else:
+                        self.assertNotIn('arm',wheel.port.sent)
+                    self.assertNotIn('stop',wheel.port.sent)
 
 
 class ConfigurationTests(unittest.TestCase):

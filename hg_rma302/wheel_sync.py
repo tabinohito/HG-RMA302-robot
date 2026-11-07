@@ -93,7 +93,7 @@ class WheelSync:
             return None
         return measured
 
-    def update(self, output, wheels, now, *, enabled):
+    def update(self, output, wheels, now, *, enabled, yaw_control=False):
         requested = (output.left_rpm, output.right_rpm)
         if not enabled:
             self.reset()
@@ -102,6 +102,9 @@ class WheelSync:
               max(0.0, min(now-self.previous_time, self.settings.loop_timeout_s)))
         self.previous_time = now
         previous_requested, self.requested = self.requested, requested
+        group_wait = yaw_control and all(requested) and any(
+            self._closed_speed(wheel,self._sign(target),now) is None
+            for wheel,target in zip(wheels,requested))
         if (not output.synchronize or not all(requested)
                 or not math.isclose(abs(requested[0]), abs(requested[1]), abs_tol=.001)):
             # Independent sticks retain independent profiles, including across
@@ -111,7 +114,7 @@ class WheelSync:
             self.reason = None
             targets = []
             for index, (profile, target) in enumerate(zip(self.profiles, requested)):
-                if target and (index >= len(wheels) or
+                if target and (group_wait or index >= len(wheels) or
                         self._closed_speed(wheels[index], self._sign(target), now) is None):
                     target = self._sign(target)*self.settings.min_speed_rpm
                     self.reason = 'WAITING_FOR_WHEEL'
@@ -140,6 +143,13 @@ class WheelSync:
             self.speed = minimum
             self.reason = 'WAITING_FOR_WHEELS'
             magnitudes = (minimum, minimum)
+        elif yaw_control:
+            # Yaw feedback owns left/right correction. Equal-wheel feedback
+            # would otherwise fight the intentional differential needed to
+            # hold a heading. Keep shared startup and acceleration shaping.
+            self.speed=min(maximum,self.speed+self.settings.acceleration_rpm_s*dt)
+            magnitudes=(self.speed,self.speed)
+            self.reason=None
         else:
             slowest = min(measured)
             # Ramp a common reference; don't keep asking for an unreachable

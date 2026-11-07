@@ -10,9 +10,9 @@ from .control import InputState
 # Linux input-event-codes.h, stable evdev ABI.
 EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
 SYN_REPORT, SYN_DROPPED = 0, 3
-ABS_X, ABS_Y, ABS_RY, ABS_HAT0X, ABS_HAT0Y = 0, 1, 4, 16, 17
-CONTROL_AXES = (ABS_Y, ABS_RY, ABS_HAT0X, ABS_HAT0Y)
-BTN_B, BTN_LB, BTN_START = 305, 310, 315
+ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_HAT0X, ABS_HAT0Y = 0, 1, 3, 4, 16, 17
+CONTROL_AXES = (ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_HAT0X, ABS_HAT0Y)
+BTN_B, BTN_LB, BTN_START, BTN_MODE = 305, 310, 315, 316
 SUPPORTED_GAMEPADS = {
     (0x046D, 0xC21D): "Logitech F310 (XInput)",
     (0x046D, 0xC21F): "Logitech F710 (XInput)",
@@ -33,12 +33,13 @@ class EventDecoder:
     """Publish whole SYN_REPORT frames, preserving button edges within a batch."""
 
     def __init__(self, axes: dict[int, tuple[int, int, int]], keys=()):
-        self.axes = axes
+        self.axes = axes = {ABS_X:(0,-32768,32767),ABS_RX:(0,-32768,32767),**axes}
         self.state = InputState(
             left_stick=-normalize(*axes[ABS_Y]),
             right_stick=-normalize(*axes[ABS_RY]),
             dpad_x=axes[ABS_HAT0X][0], dpad_y=-axes[ABS_HAT0Y][0],
             estop=BTN_B in keys, reset=BTN_START in keys,
+            left_x=normalize(*axes[ABS_X]),right_x=normalize(*axes[ABS_RX]),mode_toggle=BTN_MODE in keys,
         )
         self.changed = False
         self.changed_at = self.state.last_input_at
@@ -49,15 +50,18 @@ class EventDecoder:
             raise OSError("Gamepad SYN_DROPPED: input queue overflow; restart with both sticks and D-pad neutral")
         field = None
         if event_type == EV_ABS and code in CONTROL_AXES:
-            field = {ABS_Y: "left_stick", ABS_RY: "right_stick",
+            field = {ABS_X:"left_x", ABS_RX:"right_x", ABS_Y: "left_stick", ABS_RY: "right_stick",
                      ABS_HAT0X: "dpad_x", ABS_HAT0Y: "dpad_y"}[code]
             if code in (ABS_Y, ABS_RY):
                 _, low, high = self.axes[code]
                 value = -normalize(value, low, high)
+            elif code in (ABS_X,ABS_RX):
+                _,low,high=self.axes[code]
+                value=normalize(value,low,high)
             elif code == ABS_HAT0Y:
                 value = -value
         elif event_type == EV_KEY and value in (0, 1):
-            field = {BTN_B: "estop", BTN_START: "reset"}.get(code)
+            field = {BTN_B: "estop", BTN_START: "reset", BTN_MODE:"mode_toggle"}.get(code)
             value = bool(value)
         if field is not None:
             self.state = replace(self.state, **{field: value})

@@ -3,6 +3,11 @@ import test_power_integration as integrated
 PROGRAM = integrated.PROGRAM
 
 SCENARIO = r'''
+static void expect_mode_leds(uint32_t state, uint32_t mode) {
+    assert(led_changes);
+    for (unsigned i=0; i<30; ++i) assert(led_pixels[i]==(i<24 ? state : mode));
+}
+
 static void command_text(const char *text) {
     char command[128]; snprintf(command,sizeof(command),"%s",text);
     console(command,now_us/1000);
@@ -13,9 +18,9 @@ static void scenario(uint32_t ms) {
     case 300: command_text("claim 123"); assert(host.managed && !gpio_get(2)); break;
     case 350: command_text("host 123 1 READY"); break;
     case 400: switch_down=true; break;
-    case 450: assert(control.enabled && gpio_get(2)); expect_leds(0x08000800); break;
-    case 500: switch_down=false; command_text("host 123 2 DRIVING"); break;
-    case 550: expect_leds(0x0c000000); break;
+    case 450: assert(control.enabled && gpio_get(2)); expect_mode_leds(0x08000800,0x08000c00); break;
+    case 500: switch_down=false; command_text("host 123 2 DRIVING joystick"); break;
+    case 550: expect_mode_leds(0x0c000000,0x060c0000); break;
     case 600: command_text("estop"); assert(host.estop && !control.enabled && !gpio_get(2)); break;
     case 650: switch_down=true; break;
     case 700:
@@ -34,6 +39,8 @@ static void scenario(uint32_t ms) {
         command_text("host 123 4 DRIVING"); assert(host.seen_at==900);
         command_text("host -1 5 DRIVING"); assert(host.seen_at==900);
         command_text("host 123 5 UNKNOWN"); assert(host.seen_at==900);
+        command_text("host 123 5 READY invalid"); assert(host.seen_at==900);
+        command_text("host 123 5 READY tank extra"); assert(host.seen_at==900);
         command_text("host 123 5 DRIVING"); assert(host.estop && !gpio_get(2));
         command_text("clear 125"); assert(host.estop);
         break;

@@ -16,7 +16,10 @@ class DriveSettings:
     left_sign: int = 1
     right_sign: int = 1
     acceleration_rpm_s: float = 20.0
-    steering_gain: float = 1.5  # Accepted for older JSON files; unused in tank mode.
+    steering_gain: float = 1.5  # Retained for old JSON; joystick steering uses joystick_turn_ratio.
+    control_mode: str = "tank"
+    steering_deadzone: float = 0.2
+    joystick_turn_ratio: float = 0.5
     dpad_drive_ratio: float = 0.5
     dpad_turn_ratio: float = 0.25
     dpad_smoothing_s: float = 0.15
@@ -25,7 +28,9 @@ class DriveSettings:
     observer_retry_delay_s: float = 2.5
 
     def __post_init__(self):
-        for name in ("max_current_a", "min_speed_rpm", "max_speed_rpm", "acceleration_rpm_s", "steering_gain", "dpad_drive_ratio", "dpad_turn_ratio", "dpad_smoothing_s", "stick_smoothing_s", "deadzone",
+        if self.control_mode not in ("tank", "joystick"):
+            raise ValueError("control_mode must be tank or joystick")
+        for name in ("max_current_a", "min_speed_rpm", "max_speed_rpm", "acceleration_rpm_s", "steering_gain", "steering_deadzone", "joystick_turn_ratio", "dpad_drive_ratio", "dpad_turn_ratio", "dpad_smoothing_s", "stick_smoothing_s", "deadzone",
                      "input_timeout_s", "loop_timeout_s", "observer_retry_delay_s"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -43,7 +48,9 @@ class DriveSettings:
             raise ValueError("acceleration_rpm_s must be in [1, 30]")
         if not .5 <= self.steering_gain <= 3:
             raise ValueError("steering_gain must be in [0.5, 3]")
-        for name in ("dpad_drive_ratio", "dpad_turn_ratio"):
+        if not .01 <= self.steering_deadzone < .8:
+            raise ValueError("steering_deadzone must be in [0.01, 0.8)")
+        for name in ("dpad_drive_ratio", "dpad_turn_ratio", "joystick_turn_ratio"):
             if not 0 < getattr(self, name) <= 1:
                 raise ValueError(f"{name} must be in (0, 1]")
         for name in ("dpad_smoothing_s", "stick_smoothing_s"):
@@ -79,6 +86,9 @@ class InputState:
     last_input_at: float = -math.inf  # Monotonic event time, not polling time.
     connected: bool = True
     last_device_check_at: float = -math.inf  # Successful wired-device ioctl; not an input event.
+    left_x: float = 0.0
+    right_x: float = 0.0
+    mode_toggle: bool = False  # Xbox/Guide button, rising edge only.
 
 
 @dataclass(frozen=True)
@@ -88,6 +98,7 @@ class Output:
     enabled: bool = False
     reason: str = "DISARMED"
     synchronize: bool = False  # D-pad commands move both wheels together.
+    control_mode: str = "tank"
 
 
 def deadzone(value: float, width: float) -> float:
@@ -133,9 +144,46 @@ def tank_targets(sample: InputState, cfg: DriveSettings) -> tuple[float, float]:
     return wheel_speed(left, cfg) * cfg.left_sign, wheel_speed(right, cfg) * cfg.right_sign
 
 
+def controls_neutral(sample: InputState, cfg: DriveSettings) -> bool:
+    return (abs(sample.left_stick)<=cfg.deadzone and abs(sample.right_stick)<=cfg.deadzone
+            and abs(sample.left_x)<=cfg.steering_deadzone and abs(sample.right_x)<=cfg.steering_deadzone
+            and not sample.dpad_x and not sample.dpad_y)
+
+
+def supported_pair(left: float, right: float, minimum: float, maximum: float) -> tuple[float, float]:
+    """Preserve steering ratios on saturation and enforce the ESC speed bounds."""
+    scale = max(1.0, abs(left) / maximum, abs(right) / maximum)
+
+    def bounded(value: float) -> float:
+        if abs(value) < 1e-9:
+            return 0.0
+        # Even value / (value / maximum) can round above maximum (e.g.
+        # 100.00000000000001 RPM). Bound AFTER scaling so a valid turn never
+        # trips EscPair's range check; the protocol limits remain unchanged.
+        speed = min(maximum, max(minimum, abs(value) / scale))
+        return math.copysign(speed, value)
+
+    return bounded(left), bounded(right)
+
+
+def joystick_targets(sample: InputState, cfg: DriveSettings) -> tuple[float,float]:
+    if sample.dpad_x or sample.dpad_y:
+        return tank_targets(sample,cfg)
+    forward=stick_speed(sample.left_stick,cfg)
+    # Left horizontal steers only while translating. Right horizontal rotates
+    # on the spot at neutral throttle, or adds yaw while moving. Right vertical is unused.
+    steer=abs(forward)*deadzone(sample.left_x,cfg.steering_deadzone)
+    spin=deadzone(sample.right_x,cfg.steering_deadzone)*cfg.stick_full_scale_rpm*cfg.joystick_turn_ratio
+    left,right=supported_pair(forward+steer+spin,forward-steer-spin,cfg.min_speed_rpm,cfg.stick_full_scale_rpm)
+    return left*cfg.left_sign,right*cfg.right_sign
+
+
 class DriveController:
     def __init__(self, settings: DriveSettings, *, require_input_updates: bool = True):
         self.settings = settings
+        self.mode = settings.control_mode
+        self.previous_mode = False
+        self.input_seen = False
         self.require_input_updates = require_input_updates
         self.ready = False
         self.motion_since_stop = False
@@ -153,7 +201,7 @@ class DriveController:
         self.motion_since_stop = False
         self.ready = False
         self.direction_wait_until = None
-        self.output = Output(reason=reason)
+        self.output = Output(reason=reason,control_mode=self.mode)
         return self.output
 
     def update(self, sample: InputState, now: float) -> Output:
@@ -162,11 +210,14 @@ class DriveController:
         self.previous_time = now
         reset_pressed = sample.reset and not self.previous_reset
         self.previous_reset = sample.reset
+        mode_pressed = self.input_seen and sample.mode_toggle and not self.previous_mode
+        self.input_seen = True
+        self.previous_mode = sample.mode_toggle
         if sample.estop:
             self.estop_latched = True
         if not sample.connected:
             return self._stop("DISCONNECTED")
-        if (not all(math.isfinite(x) for x in (sample.left_stick, sample.right_stick, now))
+        if (not all(math.isfinite(x) for x in (sample.left_stick, sample.right_stick, sample.left_x, sample.right_x, now))
                 or any(type(x) is not int or x not in (-1, 0, 1) for x in (sample.dpad_x, sample.dpad_y))):
             return self._stop("INVALID_INPUT")
         checked_at = sample.last_input_at if self.require_input_updates else sample.last_device_check_at
@@ -175,31 +226,33 @@ class DriveController:
             return self._stop("INPUT_TIMEOUT" if self.require_input_updates else "GAMEPAD_POLL_TIMEOUT")
         if not 0 <= dt <= cfg.loop_timeout_s:
             return self._stop("LOOP_TIMEOUT")
-        neutral = (abs(sample.left_stick) <= cfg.deadzone and abs(sample.right_stick) <= cfg.deadzone
-                   and not sample.dpad_x and not sample.dpad_y)
+        neutral = controls_neutral(sample,cfg)
         if self.estop_latched:
             if reset_pressed and not sample.estop and neutral:
                 self.estop_latched = False
             else:
                 return self._stop("STOP_LATCHED")
+        if mode_pressed:
+            self.mode = "joystick" if self.mode == "tank" else "tank"
+            return self._stop("MODE_CHANGED")
         if not self.ready:
             if not neutral:
                 return self._stop("CENTER_CONTROLS")
             self.ready = True
-            self.output = Output(reason="READY")
+            self.output = Output(reason="READY",control_mode=self.mode)
             return self.output
 
-        targets = tank_targets(sample, cfg)
+        targets = (joystick_targets if self.mode=="joystick" else tank_targets)(sample,cfg)
         if not any(targets):
             self.direction_wait_until = None
             # Keep the speed session alive: rpm 0 brakes to rest, and the ESC
             # handles the next direction without an uncontrolled PWM-off stop.
             self.output = Output(enabled=self.motion_since_stop,
-                                 reason="DPAD_DIAGONAL_STOP" if sample.dpad_x and sample.dpad_y else "READY")
+                                 reason="DPAD_DIAGONAL_STOP" if sample.dpad_x and sample.dpad_y else "READY",control_mode=self.mode)
             return self.output
         if self.direction_wait_until is not None:
             if now < self.direction_wait_until:
-                self.output = Output(reason="DIRECTION_CHANGE_WAIT")
+                self.output = Output(reason="DIRECTION_CHANGE_WAIT",control_mode=self.mode)
                 return self.output
             self.direction_wait_until = None
         signs = [0 if value == 0 else (1 if value > 0 else -1) for value in targets]
@@ -208,10 +261,12 @@ class DriveController:
             # reversal dwell. Normal neutral/reversal uses controlled braking.
             if now - self.last_motion_at < 2.5:
                 self.direction_wait_until = now + 2.5
-                self.output = Output(reason="DIRECTION_CHANGE_WAIT")
+                self.output = Output(reason="DIRECTION_CHANGE_WAIT",control_mode=self.mode)
                 return self.output
         self.output = Output(*targets, enabled=True, reason="DRIVING",
-                             synchronize=bool(sample.dpad_x or sample.dpad_y))
+                             synchronize=bool(sample.dpad_x or sample.dpad_y) or
+                                 (self.mode=='joystick' and math.isclose(abs(targets[0]),abs(targets[1]))),
+                             control_mode=self.mode)
         for index, value in enumerate(targets):
             if value:
                 self.motion_since_stop = True

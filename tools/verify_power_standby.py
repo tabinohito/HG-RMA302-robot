@@ -48,6 +48,7 @@ def main():
         def read(self):
             now=time.monotonic();elapsed=now-self.started
             self.state=InputState(estop=3.5<elapsed<3.6,reset=4.5<elapsed<4.6,
+                                  mode_toggle=(2.5<elapsed<2.6 or 5.5<elapsed<5.6),
                                   last_device_check_at=now,last_input_at=now)
             return [self.state]
         def close(self):pass
@@ -68,7 +69,9 @@ def main():
     link=None
     try:
         for p in ports:p.stop()
-        for p in ports:check_stopped(query_status(p))
+        for p in ports:
+            p.synchronize()
+            check_stopped(query_status(p))
         link=open_link();link.estop();poll_for(link,.15)
         assert link.status['estop']=='1' and link.status['relay']=='0'
         link.clear();poll_for(link,.15)
@@ -104,7 +107,7 @@ def main():
     try:
         final_esc=[]
         for p in ports:
-            p.stop();s=query_status(p);check_stopped(s);final_esc.append(s)
+            p.synchronize();s=query_status(p);check_stopped(s);final_esc.append(s)
     finally:
         for p in ports:p.close()
     (folder/'result.json').write_text(json.dumps({'finished_at':datetime.now(timezone.utc).isoformat(),

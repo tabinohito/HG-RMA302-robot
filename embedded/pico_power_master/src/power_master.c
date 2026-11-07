@@ -23,7 +23,7 @@ static power_measurement_t measured;
 static bool sensor_valid, reset_active;
 static power_control_t control;
 static cart_host_t host;
-static uint32_t sample_at, led_rgb;
+static uint32_t sample_at, led_rgb, mode_led_rgb;
 static uint32_t reset_started;
 static PIO const led_pio = pio0;
 static uint led_sm;
@@ -69,11 +69,11 @@ static void print_status(void) {
                 panel.online, control.enabled, gpio_get(POWER_RELAY_PIN), mode_name(), gpio_get(POWER_BUTTON_PIN),
                 (unsigned long)dropped);
     printf(" power_protocol=1 session=%lu seq=%lu uptime_ms=%lu estop=%u host_state=%s stop_reason=%s "
-           "sample_age_ms=%lu current_valid=%u shunt_raw=%d led_rgb=%lu keys=%u\n",
+           "sample_age_ms=%lu current_valid=%u shunt_raw=%d led_rgb=%lu keys=%u drive_mode=%s mode_led_rgb=%lu\n",
            (unsigned long)host.session,(unsigned long)host.sequence,(unsigned long)now,host.estop,
            cart_state_names[host.state],host.stop_reason ? host.stop_reason : "none",
            (unsigned long)(now-sample_at),sensor_valid && measured.shunt_raw!=INT16_MIN && measured.shunt_raw!=INT16_MAX,
-           measured.shunt_raw,(unsigned long)led_rgb,panel.keys);
+           measured.shunt_raw,(unsigned long)led_rgb,panel.keys,host.joystick ? "joystick" : "tank",(unsigned long)mode_led_rgb);
 }
 
 static void scan_sensor(void) {
@@ -119,7 +119,7 @@ static void start_esp_reset(void) {
 
 static void console(char *line, uint32_t now) {
     if (!strcmp(line, "cap")) {
-        printf("power_protocol=1 watchdog_ms=750 remote_on=0 led_state=1 estop_latch=1 shunt_uohm=%u\n",POWER_SHUNT_UOHM);
+        printf("power_protocol=1 watchdog_ms=750 remote_on=0 led_state=1 estop_latch=1 drive_modes=1 shunt_uohm=%u\n",POWER_SHUNT_UOHM);
     } else if (!strcmp(line,"estop")) {
         cart_stop(&host,"controller"); set_power(false,now); printf("OK estop\n"); print_status();
     } else if (!strncmp(line,"claim ",6)) {
@@ -128,11 +128,13 @@ static void console(char *line, uint32_t now) {
             printf("OK claim=%lu\n",(unsigned long)id); print_status();
         } else printf("ERR claim\n");
     } else if (!strncmp(line,"host ",5)) {
-        char sid[12],seq[12],state[16],extra; uint32_t id,n;
-        if(sscanf(line+5,"%11s %11s %15s %c",sid,seq,state,&extra)==3 &&
-           cart_u32(sid,&id) && cart_u32(seq,&n) && cart_heartbeat(&host,id,n,state,now))
+        char sid[12],seq[12],state[16],mode[12],extra; uint32_t id,n;
+        int count=sscanf(line+5,"%11s %11s %15s %11s %c",sid,seq,state,mode,&extra);
+        if((count==3 || (count==4 && (!strcmp(mode,"tank") || !strcmp(mode,"joystick")))) &&
+           cart_u32(sid,&id) && cart_u32(seq,&n) && cart_heartbeat(&host,id,n,state,now)) {
+            host.joystick=count==4 && !strcmp(mode,"joystick");
             printf("OK host=%lu seq=%lu\n",(unsigned long)id,(unsigned long)n);
-        else printf("ERR host\n");
+        } else printf("ERR host\n");
     } else if (!strncmp(line,"clear ",6)) {
         uint32_t id;
         if(cart_u32(line+6,&id) && cart_clear(&host,id,now,!gpio_get(POWER_BUTTON_PIN),control.enabled)) {
@@ -201,7 +203,7 @@ static void init_peripherals(void) {
 }
 
 static void update_led(void) {
-    static uint32_t previous = UINT32_MAX;
+    static uint32_t previous = UINT32_MAX, previous_mode = UINT32_MAX;
     static uint32_t sent_at;
     uint8_t red = 0, green = 0, blue = 8;
     if (control.enabled) {
@@ -226,9 +228,12 @@ static void update_led(void) {
     led_rgb=((uint32_t)red<<16)|((uint32_t)green<<8)|blue;
     uint32_t grb = ((uint32_t)green << 16) | ((uint32_t)red << 8) | blue;
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (grb != previous || (uint32_t)(now - sent_at) >= POWER_WS2812_REFRESH_MS) {
+    bool show_mode=host.managed && !host.estop && host.state!=CART_FAULT && host.state!=CART_STOPPED;
+    mode_led_rgb=show_mode ? (host.joystick ? 0x0c0600u : 0x00080cu) : led_rgb;
+    uint32_t mode_grb=((mode_led_rgb & 0xff00u)<<8)|((mode_led_rgb & 0xff0000u)>>8)|(mode_led_rgb & 0xffu);
+    if (grb != previous || mode_grb != previous_mode || (uint32_t)(now - sent_at) >= POWER_WS2812_REFRESH_MS) {
         for (unsigned i = 0; i < POWER_WS2812_COUNT; ++i)
-            led_buffer[i] = grb << 8;
+            led_buffer[i] = (i>=POWER_WS2812_COUNT-6 ? mode_grb : grb) << 8;
         // DREQ-paced DMA feeds all pixels even while USB/UART IRQs run.
         dma_channel_transfer_from_buffer_now(led_dma, led_buffer, POWER_WS2812_COUNT);
         dma_channel_wait_for_finish_blocking(led_dma);
@@ -236,7 +241,7 @@ static void update_led(void) {
         while (!pio_sm_is_tx_fifo_empty(led_pio, led_sm)) tight_loop_contents();
         // At most one 24-bit pixel (30 us at 800 kHz) is still in the shifter.
         sleep_us(30u + POWER_WS2812_RESET_US);
-        previous = grb;
+        previous = grb; previous_mode = mode_grb;
         sent_at = to_ms_since_boot(get_absolute_time());
     }
 }

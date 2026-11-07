@@ -25,6 +25,19 @@ class WheelSyncTests(unittest.TestCase):
     def update(self, wheels, now, output=None, enabled=True):
         return self.sync.update(output or self.forward, wheels, now, enabled=enabled)
 
+    def test_yaw_control_waits_for_both_and_does_not_fight_heading_differential(self):
+        out=Output(40,-20,True)
+        for i in range(30):
+            now=i*.02
+            result=self.sync.update(out,[wheel(8,now),wheel(-8,now,state='ramp')],now,enabled=True,yaw_control=True)
+            self.assertEqual(result,(8,-8))
+        # Once both wheels run, unequal measured speeds must not add a second
+        # differential controller over the IMU's correction.
+        for i in range(30,400):
+            now=i*.02
+            result=self.sync.update(self.forward,[wheel(55,now),wheel(-45,now)],now,enabled=True,yaw_control=True)
+        self.assertAlmostEqual(result[0],-result[1]);self.assertAlmostEqual(result[0],50,places=3)
+
     def test_recorded_asymmetric_startup_never_accelerates_early_wheel(self):
         fixture = json.loads((Path(__file__).parent/'fixtures/dpad-startup-20261105.json').read_text())
         held = 0

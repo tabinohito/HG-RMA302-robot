@@ -9,11 +9,12 @@ from hg_rma302.control import DriveSettings, InputState
 from hg_rma302.power import PowerLink, PowerError
 from hg_rma302.power_settings import PowerSettings
 from hg_rma302.power_drive import run_powered
+from hg_rma302.imu import ImuSettings, ImuError
 from test_power import Board
 
 
 class PoweredLoopTests(unittest.TestCase):
-    def scenario(self, input_at, board_at, *, duration=1.5, preflight=.08, failure=None):
+    def scenario(self, input_at, board_at, *, duration=1.5, preflight=.08, failure=None, imu_reason=None):
         clock=SimpleNamespace(now=0.)
         def sleep(n): clock.now+=max(n,.00001)
         timeline=[]; pairs=[]; links=[]; rows=[]
@@ -65,20 +66,30 @@ class PoweredLoopTests(unittest.TestCase):
         def power_factory(settings):
             link=PowerLink(settings,port_factory=ClockBoard,now=clock.now)
             links.append(link);return link
+        class FakeImu:
+            path='/fake/imu';settings=ImuSettings();yaw=0.;rate=0.;closed=False
+            def poll(self,now):pass
+            def reason(self,now):return imu_reason(now)
+            def snapshot(self,now):return {'reason':self.reason(now)}
+            def close(self):self.closed=True
+        fake_imu=FakeImu()
         class Logger:
             def snapshot(self,sample,out,pair,now,**kw):
                 rows.append((now,out,kw['power'].snapshot(now)))
             def record(self,*a,**kw):pass
             def warning(self):return None
         pad=Pad();caught=None
-        cfg=Config(DriveSettings(),power=PowerSettings(enabled=True,port='/fake/pico'))
+        cfg=Config(DriveSettings(),power=PowerSettings(enabled=True,port='/fake/pico'),
+                   imu=ImuSettings(enabled=imu_reason is not None,port='/fake/imu'))
         stdout=io.StringIO()
         with patch('hg_rma302.power_drive.time',SimpleNamespace(monotonic=lambda:clock.now,sleep=sleep)), \
              patch('hg_rma302.power_drive.Gamepad',return_value=pad), \
              patch('hg_rma302.power_drive.PowerLink',side_effect=power_factory), \
-             patch('hg_rma302.power_drive.EscPair',Pair),patch('sys.stdout',new=stdout):
+             patch('hg_rma302.power_drive.EscPair',Pair),patch('hg_rma302.power_drive.ImuLink',return_value=fake_imu), \
+             patch('sys.stdout',new=stdout):
             try:run_powered(cfg,seconds=duration,logger=Logger())
             except Exception as exc:caught=exc
+        if imu_reason:self.assertTrue(fake_imu.closed)
         self.assertTrue(pad.closed)
         self.assertTrue(all(p.closed for p in pairs))
         self.assertTrue(all(p.port.closed for p in links))
@@ -125,6 +136,17 @@ class PoweredLoopTests(unittest.TestCase):
             self.assertEqual(link.port.relay,0)
             stop=next(t for t,d,c in events if d=='pico' and c=='estop')
             self.assertFalse(any(t>stop and d=='esc' and o!='close' and o.enabled and o.left_rpm for t,d,o in events))
+
+    def test_imu_loss_stops_esc_and_ssr_and_calibration_needs_neutral(self):
+        def inputs(now,last):return InputState(left_stick=int(now>.6))
+        def board(b,now):
+            if now<.75:b.relay=1
+        def reason(now):return 'IMU_CALIBRATING' if now<.5 else 'IMU_STALE' if now>.8 else None
+        events,rows,link,exc,_=self.scenario(inputs,board,imu_reason=reason)
+        self.assertIsInstance(exc,ImuError)
+        self.assertEqual(link.port.relay,0);self.assertIn('estop',link.port.sent)
+        moving=[t for t,d,o in events if d=='esc' and o!='close' and o.enabled and o.left_rpm]
+        self.assertTrue(moving);self.assertGreater(min(moving),.6);self.assertLess(max(moving),.81)
 
     def test_failed_pico_stop_write_still_closes_esc(self):
         def inputs(now,last):return InputState(estop=now>.6)

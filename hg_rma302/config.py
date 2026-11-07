@@ -6,6 +6,7 @@ from pathlib import Path
 from .control import DriveSettings
 from .esc_settings import EscSettings
 from .power_settings import PowerSettings
+from .imu import ImuSettings
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class Config:
     left_esc: EscSettings | None = None
     right_esc: EscSettings | None = None
     power: PowerSettings = PowerSettings()
+    imu: ImuSettings = ImuSettings()
 
     def __post_init__(self):
         for settings in (self.esc, self.left_esc, self.right_esc):
@@ -69,6 +71,10 @@ def load_config(path: str) -> Config:
     if not isinstance(drive, dict):
         raise ValueError("drive must be a JSON object")
     esc = raw.pop('esc', {})
+    imu = raw.pop('imu', {})
+    if not isinstance(imu, dict):
+        raise ValueError('imu must be a JSON object')
+    raw['imu'] = ImuSettings(**imu)
     power = raw.pop('power', {})
     if not isinstance(power, dict):
         raise ValueError('power must be a JSON object')

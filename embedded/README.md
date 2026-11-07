@@ -35,7 +35,7 @@
 }
 ```
 
-`serial` 指定時はUSB ID 2e8a:000aと固有番号の両方で特定します。見つからなくても古いポート番号へフォールバックしません。`power` を省略／無効にした旧設定ではESC単独動作のままで、SSR停止は使えません。`config.local.json` にこの機体の固有番号を設定しています。新Picoファームウェア導入後に `enabled` を `true` にします。配布例では無効です。
+`serial` 指定時はUSB ID 2e8a:000aと固有番号の両方で特定します。見つからなくても古いポート番号へフォールバックしません。`power` を省略／無効にした旧設定ではESC単独動作のままで、SSR停止は使えません。`config.local.json` は新Picoファームウェア導入済みのこの機体用に、固有番号を設定し `enabled=true` にしています。配布例では無効です。
 
 ```bash
 # 電源測定・Statusを見るだけ。SSR・LED・セッションを変更しない
@@ -61,7 +61,7 @@ uv run hg-cart drive --config config.local.json --live --log
 | INA226未取得 | 黄橙 |
 | ESP32パネル切断 | 紫 |
 
-停止保持は他の表示より優先します。パネル切断や未取得は走行状態の色より優先します。LED更新は250 ms周期、状態通知は100 ms周期です。Pythonが未接続のときは元の単独動作の色と物理ボタン操作を使います。
+先頭24灯は上記状態、末尾6灯は操作モード（水色=tank、橙=joystick）を表示します。Statusの `drive_mode` と `mode_led_rgb` でも確認できます。停止保持・FAULTでは末尾も赤です。停止保持は他の表示より優先します。パネル切断や未取得は走行状態の色より優先します。LED更新は250 ms周期、状態通知は100 ms周期です。Pythonが未接続のときは元の単独動作の色と物理ボタン操作を使います。
 
 ログの `power` に `voltage_v`, `current_a`, `power_w`, `current_saturated`, `ssr_command_on`, `estop`, `status_age_s`, 生の `status` を記録します。生Statusには表示モード、キー、LED色、セッション、通信連番、測定経過時間、停止理由も含みます。
 
@@ -72,14 +72,14 @@ uv run hg-cart drive --config config.local.json --live --log
 ASCII 1行1コマンド、CR/LF、115200設定。`cap` の応答は次の通りです。
 
 ```
-power_protocol=1 watchdog_ms=750 remote_on=0 led_state=1 estop_latch=1 shunt_uohm=100000
+power_protocol=1 watchdog_ms=750 remote_on=0 led_state=1 estop_latch=1 drive_modes=1 shunt_uohm=100000
 ```
 
 | コマンド | 意味 |
 | --- | --- |
 | `status` | 測定・SSR指令・パネル・停止保持・LED・ホスト状態を1行で返す |
 | `claim ID` | 非ゼロ32bitセッションを取得。有効な別セッションがあれば拒否。SSRは変更しない |
-| `host ID SEQ STATE` | 連番が増加するheartbeatとLED状態。停止保持は解除しない |
+| `host ID SEQ STATE tank/joystick` | 連番が増加するheartbeat、LED状態と操作モード。停止保持は解除しない |
 | `estop` | セッションに関係なくSSR OFF＋停止保持 |
 | `clear ID` | 有効な接続、SSR OFF、物理ボタン解放時だけ停止保持を解除。ONしない |
 | `release ID` | SSR OFFにして所有権を返す。停止保持は残る |
@@ -120,3 +120,21 @@ Pico書き込み後、走行プログラムを終了してから実行します�
 ```
 
 出力フォルダは新しい名前を指定してください。この試験だけでは実負荷・物理ボタンによるON・SSR接点の実際の遮断性能を確認したことにはなりません。
+
+## この機体への導入記録（2026-11-08）
+
+Pico固有番号 `DE610441238C2E35` に統合版UF2を書き込み、picotoolの読み戻し検証が成功しました。ESP32の表示通信は互換のため、ESP32・左右ESCのファームウェアは変更していません。
+
+- UF2 SHA-256: `31b64e52f795828249cce53bccafcbefec085174bb8016d07610a5ab30763f84`
+- 旧Pico全フラッシュの保存・検証済み: `artifacts/hardware/2026-11-08/power-integration/pico-before.uf2`
+- 停止試験: `artifacts/hardware/2026-11-08/power-integration/standby-2/`
+- USB給電のみの約5 Vで待機、模擬B入力で停止保持、模擬Start入力で保持解除のみ、heartbeat停止で `host_timeout` のラッチを実機確認しました。LED出力値は青と赤を確認しています。
+- 最後はSSR出力OFF、停止保持解除、両ESC `idle/fault=none/MOE=0/CCER=0`。回転指令は送っていません。SSR ONからの遮断・実走行はこの試験に含みません。
+
+BOOTSELへはアプリのUSB固有番号を指定して `picotool reboot -u -f` で移行できます。BOOTSELでのUSB文字列はアプリの固有番号と異なったため、`picotool info -a` のflash idとUSB接続位置を照合し、その時点のbus/addressに限定して保存・書き込みしました。bus/addressの数値は再接続で変わるため固定しないでください。
+
+### モード表示対応版（同日更新）
+
+現在の導入版は `drive_modes=1` に対応します。UF2 SHA-256は `05687f73a720474dcd58f4af191db9887ab02f91dc33e0a5ad549aa551444471` です。旧版のプログラムは `artifacts/hardware/2026-11-08/imu/pico-before-modes.uf2`、書き込み・実機検証記録は同じ `imu/` フォルダです。
+
+模擬Xboxロゴ入力でtank/joystickの往復を実際のホスト制御ループへ通し、PicoのStatusで末尾LEDが水色／橙へ変わることを確認しました。WT61の静止校正と連続受信、B/Start・通信断監視も通過しています。両ESCのPWMとSSRは最後にOFF、回転指令は送っていません。接地走行のYawゲイン調整・実際の右旋回によるIMU符号確認は未実施です。

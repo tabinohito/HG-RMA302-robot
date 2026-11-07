@@ -1,1 +1,1 @@
-"""Gamepad differential wheel-speed control. WT61 is deliberately not used."""
+"""Gamepad differential wheel-speed control with optional WT61 yaw feedback."""

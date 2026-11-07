@@ -68,6 +68,7 @@ def _run(config, *, live=False, seconds=None, logger=None):
     pair = None
     gamepad = None
     output = None
+    imu = yaw = None
     stopped = False
     stop_reason = "finished"
 
@@ -86,8 +87,12 @@ def _run(config, *, live=False, seconds=None, logger=None):
             logger.record("gamepad", name=device.name, path=device.path,
                           usb_id=f"{device.info.vendor:04x}:{device.info.product:04x}",
                           requires_event_updates=gamepad.requires_event_updates)
+        if live and config.imu.enabled:
+            from .imu import ImuLink, YawFeedback
+            imu=ImuLink(config.imu);yaw=YawFeedback(imu,config.drive)
         if live:
             pair = EscPair(config)
+            if yaw: pair.yaw_feedback=yaw
             if logger:
                 logger.record("esc_connected", devices={
                     side: {"serial": getattr(config, side + "_serial"), "path": port.path}
@@ -103,7 +108,7 @@ def _run(config, *, live=False, seconds=None, logger=None):
             print(f"LIVE: 目標速度 {config.drive.min_speed_rpm:g}〜{config.drive.max_speed_rpm:g} RPM / 電流上限 各輪{config.drive.max_current_a:g} A / 速度指令の変化 {config.drive.acceleration_rpm_s:g} RPM/s", flush=True)
         else:
             print("DRY RUN: 表示のみ。モーターは動きません。実機操作には --live を付けてください。", flush=True)
-        print("開始時は両スティック中立・十字キー解放でREADYを確認。LB不要。左縦=左輪、右縦=右輪。", flush=True)
+        print("Xboxロゴ=タンク/ジョイスティック切替。左縦=前後・左横=曲がり・右横=旋回。タンクは左右縦=各輪。開始・切替後は中立。", flush=True)
         print(f"スティック: 不感帯±{config.drive.deadzone:g}の外を "
               f"{config.drive.min_speed_rpm:g}〜{config.drive.stick_full_scale_rpm:g} RPMへ線形換算。"
               "中立=0 RPM。始動中は最低速度で推定確立を待ちます。", flush=True)
@@ -131,6 +136,7 @@ def _run(config, *, live=False, seconds=None, logger=None):
                 stop_reason = "duration"
                 break
             # Evaluate every complete frame so brief release/B edges are not lost.
+            if imu: imu.poll(now)
             frames = gamepad.read()
             now = time.monotonic()
             output = None
@@ -139,15 +145,19 @@ def _run(config, *, live=False, seconds=None, logger=None):
                 if pair and (not output.enabled or not (output.left_rpm or output.right_rpm)):
                     pair.update(output, now)
                 if logger:
-                    logger.snapshot(sample, output, pair, now, kind="input_frame")
+                    logger.snapshot(sample, output, pair, now, kind="input_frame",imu=yaw)
             output = controller.update(gamepad.state, now)
+            if imu and imu.reason(now):
+                output=controller.inhibit(imu.reason(now))
+                if imu.reason(now) not in ("IMU_WAIT","IMU_CALIBRATING"):
+                    raise RuntimeError(imu.reason(now))
             if pair:
                 pair.update(output, now)
             if logger:
                 # Control/ACK polling runs at 200 Hz; periodic disk snapshots
                 # stay at 50 Hz. Input frames and fault events are never throttled.
                 if now-last_log_sample >= .02:
-                    logger.snapshot(gamepad.state, output, pair, now)
+                    logger.snapshot(gamepad.state, output, pair, now,imu=yaw)
                     last_log_sample = now
                 warning = logger.warning()
                 if warning:
@@ -173,7 +183,7 @@ def _run(config, *, live=False, seconds=None, logger=None):
                     wait = f" 逆転待機 残り{max(0, controller.direction_wait_until - now):.1f}秒（両スティック中立・十字キー解放で取消）"
                 if recovery:
                     wait = " " + recovery[1]
-                print(f"{reason:24} {inputs} RPM_cmd L={output.left_rpm:+.2f} R={output.right_rpm:+.2f}{status}{wait}", flush=True)
+                print(f"{controller.mode:8} {reason:24} {inputs} RPM_cmd L={output.left_rpm:+.2f} R={output.right_rpm:+.2f}{status}{wait}", flush=True)
                 last_print, previous_reason = now, reason
             time.sleep(max(0, .005 - (time.monotonic() - now)))
     except BaseException:
@@ -194,6 +204,7 @@ def _run(config, *, live=False, seconds=None, logger=None):
                 report_esc_events(pair, logger)
         finally:
             try:
+                if imu: imu.close()
                 if gamepad:
                     gamepad.close()
             finally:
@@ -240,7 +251,7 @@ def inspect_ports(config, seconds):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="HG-RMA302 / F310・F710・Xbox 360 compatible / two ST-Link UART ESCs")
-    parser.add_argument("command", choices=("devices", "gamepad", "demo", "inspect", "check", "power", "drive"))
+    parser.add_argument("command", choices=("devices", "gamepad", "demo", "inspect", "check", "power", "imu", "drive"))
     parser.add_argument("--config", help="configuration JSON (default: config.example.json; gamepad can run without it)")
     parser.add_argument("--device", help="gamepad event device (gamepad only; default: auto-detect)")
     parser.add_argument("--live", action="store_true", help="send drive commands (drive only)")
@@ -272,6 +283,9 @@ def main(argv=None):
             demo(config)
         elif args.command == "inspect":
             inspect_ports(config, args.seconds or 3)
+        elif args.command == "imu":
+            from .imu import monitor_imu
+            monitor_imu(config.imu,seconds=args.seconds)
         elif args.command == "power":
             from .power import monitor_power
             monitor_power(config.power, seconds=args.seconds)

@@ -14,7 +14,7 @@ static const char *const cart_state_names[] = {
     "BOOT", "USB_ONLY", "WAIT_POWER", "READY", "DRIVING", "RECOVERING", "STOPPED", "FAULT"};
 typedef struct {
     uint32_t session, sequence, seen_at;
-    bool managed, estop;
+    bool managed, estop, joystick;
     cart_state_t state;
     const char *stop_reason;
 } cart_host_t;
